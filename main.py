@@ -11,6 +11,7 @@ from core.decision_engine import DecisionEngine
 from core.deepseek_controller import DeepSeekController, DeepSeekTaskRunner
 from core.quality_checker import QualityChecker
 from core.rate_limiter import RateLimiter
+from core.task_persistence import TaskPersistence
 from core.ws_client import WSClient
 
 # 日志配置
@@ -45,6 +46,7 @@ class BrowserAIClient:
         self.quality_checker = QualityChecker()
         self.decision_engine = DecisionEngine(self.quality_checker)
         self.rate_limiter = RateLimiter()
+        self.task_store = TaskPersistence()
         self.ws_client = WSClient(WS_SERVER_URL)
 
     # ── 启动 ─────────────────────────────────────────────
@@ -97,6 +99,7 @@ class BrowserAIClient:
         print(f"\n📥 收到任务: {task_id} ({task_type})")
         logger.info("收到新任务: %s (%s)", task_id, task_type)
 
+        self.task_store.save_task(task_id, task_type, params)
         await self.execute_task(task_id, task_type, params)
 
     async def execute_task(
@@ -148,6 +151,11 @@ class BrowserAIClient:
         runner = self.runners[ai_name]
         print(f"🤖 使用 {ai_name} 执行任务 {task_id}")
 
+        # 更新持久化状态
+        self.task_store.update_task(
+            task_id, status="running", current_ai=ai_name,
+        )
+
         try:
             if task_type == "search_contacts":
                 result = await runner.search_contacts(
@@ -182,6 +190,7 @@ class BrowserAIClient:
         except Exception as e:
             logger.error("执行任务 %s 出错: %s", task_id, e)
             print(f"❌ 任务执行出错: {e}")
+            self.task_store.fail_task(task_id, str(e))
 
     async def process_result(
         self, task_id: str, task_type: str, result, ai_used: str
@@ -196,19 +205,27 @@ class BrowserAIClient:
 
         if action == "auto_approve":
             print(f"✅ 自动通过: {task_id} (分数:{score})")
+            self.task_store.complete_task(task_id, result)
             await self.ws_client.send_auto_approved(task_id, result, score)
 
         elif action == "retry":
             next_ai = decision["next_ai"]
             print(f"🔄 重试: {task_id} 使用 {next_ai} (当前分数:{score})")
+            task = self.task_store.get_task(task_id)
+            retry_count = task["retry_count"] + 1 if task else 1
+            self.task_store.update_task(
+                task_id, status="pending", current_ai=next_ai,
+                retry_count=retry_count,
+            )
             await self.execute_task(
                 task_id, task_type,
-                {},  # params 已在首次调用时使用，retry 时由 runner 内部保留上下文
+                task["params"] if task else {},
                 use_ai=next_ai,
             )
 
         elif action == "need_review":
             print(f"📱 发送审核: {task_id} (分数:{score})")
+            self.task_store.update_task(task_id, status="pending")
             best = self.decision_engine.get_best_result(task_id)
             await self.ws_client.send_need_review(
                 task_id, task_type,
@@ -245,6 +262,23 @@ class BrowserAIClient:
             logger.info("任务 %s 审核拒绝: %s", task_id, reason)
             self.decision_engine.reset_task(task_id)
 
+    # ── 任务恢复 ──────────────────────────────────────────
+
+    async def recover_tasks(self):
+        """启动时检查并恢复未完成的任务。"""
+        pending = self.task_store.get_pending_tasks()
+        if not pending:
+            return
+        print(f"\n🔄 发现 {len(pending)} 个未完成任务，正在恢复...")
+        logger.info("恢复 %d 个未完成任务", len(pending))
+        for task in pending:
+            await self.execute_task(
+                task["task_id"],
+                task["task_type"],
+                task.get("params", {}),
+                use_ai=task.get("current_ai"),
+            )
+
     # ── 主循环 & 关闭 ────────────────────────────────────
 
     async def run(self):
@@ -255,6 +289,9 @@ class BrowserAIClient:
         print("  Browser-AI 就绪")
         print(f"  可用AI: {', '.join(self.controllers.keys()) or '无'}")
         print("=" * 50 + "\n")
+
+        # 恢复上次未完成的任务
+        await self.recover_tasks()
 
         await self.ws_client.run()
 
