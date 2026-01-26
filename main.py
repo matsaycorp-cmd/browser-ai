@@ -10,6 +10,7 @@ from core.claude_controller import ClaudeController, ClaudeTaskRunner
 from core.decision_engine import DecisionEngine
 from core.deepseek_controller import DeepSeekController, DeepSeekTaskRunner
 from core.quality_checker import QualityChecker
+from core.rate_limiter import RateLimiter
 from core.ws_client import WSClient
 
 # 日志配置
@@ -43,6 +44,7 @@ class BrowserAIClient:
         self.runners: dict = {}
         self.quality_checker = QualityChecker()
         self.decision_engine = DecisionEngine(self.quality_checker)
+        self.rate_limiter = RateLimiter()
         self.ws_client = WSClient(WS_SERVER_URL)
 
     # ── 启动 ─────────────────────────────────────────────
@@ -104,17 +106,44 @@ class BrowserAIClient:
         params: dict,
         use_ai: str | None = None,
     ):
-        """选择 AI 并执行具体任务。"""
+        """选择 AI（受频率限制）并执行具体任务。"""
+        # ── 选择可用 AI ──────────────────────────────────
         ai_name = use_ai or "chatgpt"
 
-        # 回退：指定的 AI 不可用时选第一个可用的
+        # 指定的 AI 不在 runners 中 → 自动选
         if ai_name not in self.runners:
-            available = list(self.runners.keys())
-            if not available:
-                print("❌ 没有可用的AI")
-                logger.error("无可用AI，任务 %s 放弃", task_id)
-                return
-            ai_name = available[0]
+            ai_name = self.rate_limiter.get_available_ai(list(self.runners.keys()))
+        # 指定的 AI 达到速率限制 → 尝试换一个
+        elif not self.rate_limiter.can_request(ai_name):
+            wait = self.rate_limiter.get_wait_time(ai_name)
+            print(f"⚠️  {ai_name} 已达频率限制 (需等待 {wait:.0f}s)，尝试其他AI")
+            ai_name = self.rate_limiter.get_available_ai(list(self.runners.keys()))
+
+        # 所有 AI 都达到限制
+        if ai_name is None:
+            status = self.rate_limiter.get_status()
+            min_wait = min(
+                self.rate_limiter.get_wait_time(name) for name in self.runners
+            )
+            print(f"🚫 所有AI均达到频率限制，最短等待 {min_wait:.0f}s")
+            logger.warning("所有AI达到频率限制，任务 %s 等待中", task_id)
+            await self.ws_client.send_status({
+                "event": "rate_limited",
+                "task_id": task_id,
+                "wait_seconds": round(min_wait),
+                "ai_status": status,
+            })
+            # 等待后重试
+            await asyncio.sleep(min_wait + 1)
+            return await self.execute_task(task_id, task_type, params, use_ai=use_ai)
+
+        if ai_name not in self.runners:
+            print("❌ 没有可用的AI")
+            logger.error("无可用AI，任务 %s 放弃", task_id)
+            return
+
+        # ── 频率等待 ─────────────────────────────────────
+        await self.rate_limiter.wait_if_needed(ai_name)
 
         runner = self.runners[ai_name]
         print(f"🤖 使用 {ai_name} 执行任务 {task_id}")
@@ -144,6 +173,9 @@ class BrowserAIClient:
             else:
                 print(f"⚠️  未知任务类型: {task_type}")
                 return
+
+            # 记录本次请求
+            self.rate_limiter.record_request(ai_name)
 
             await self.process_result(task_id, task_type, result, ai_name)
 
