@@ -3,12 +3,13 @@
 import asyncio
 import logging
 
-from config.settings import BROWSER_DATA_DIR, WS_SERVER_URL
+from config.settings import BROWSER_DATA_DIR, EXECUTION_MODE, MAX_PARALLEL, WS_SERVER_URL
 from core.browser_manager import BrowserManager
 from core.chatgpt_controller import ChatGPTController, ChatGPTTaskRunner
 from core.claude_controller import ClaudeController, ClaudeTaskRunner
 from core.decision_engine import DecisionEngine
 from core.deepseek_controller import DeepSeekController, DeepSeekTaskRunner
+from core.parallel_executor import ParallelExecutor
 from core.quality_checker import QualityChecker
 from core.rate_limiter import RateLimiter
 from core.task_persistence import TaskPersistence
@@ -46,6 +47,7 @@ class BrowserAIClient:
         self.quality_checker = QualityChecker()
         self.decision_engine = DecisionEngine(self.quality_checker)
         self.rate_limiter = RateLimiter()
+        self.parallel_executor: ParallelExecutor | None = None  # 在 setup 后初始化
         self.task_store = TaskPersistence()
         self.ws_client = WSClient(WS_SERVER_URL)
 
@@ -79,10 +81,17 @@ class BrowserAIClient:
             self.runners[ai_name] = runner_cls(controller)
             print(f"✅ {ai_name} 已就绪")
 
-        # 3. 连接 WebSocket
+        # 3. 初始化并行执行器
+        self.parallel_executor = ParallelExecutor(
+            self.controllers, self.runners, self.rate_limiter,
+        )
+        self.parallel_executor.set_mode(EXECUTION_MODE)
+        self.parallel_executor.max_parallel = MAX_PARALLEL
+
+        # 4. 连接 WebSocket
         await self.ws_client.connect()
 
-        # 4. 注册消息处理器
+        # 5. 注册消息处理器
         self.ws_client.on("new_task", self.handle_new_task)
         self.ws_client.on("retry_task", self.handle_retry_task)
         self.ws_client.on("review_result", self.handle_review_result)
@@ -109,8 +118,62 @@ class BrowserAIClient:
         params: dict,
         use_ai: str | None = None,
     ):
-        """选择 AI（受频率限制）并执行具体任务。"""
-        # ── 选择可用 AI ──────────────────────────────────
+        """选择执行模式（单AI / 并行 / 竞速 / 最佳）并执行任务。"""
+        mode = self.parallel_executor.get_mode() if self.parallel_executor else "single"
+        available = [
+            ai for ai in self.runners
+            if self.rate_limiter.can_request(ai)
+        ]
+
+        # ── 并行模式（需要 >=2 个可用 AI 且非指定单 AI）───
+        if mode != "single" and use_ai is None and len(available) >= 2:
+            self.task_store.update_task(task_id, status="running")
+
+            # 通知 Telegram
+            await self.ws_client.send_status({
+                "mode": mode,
+                "running_ais": available,
+                "task_id": task_id,
+            })
+
+            try:
+                if mode == "parallel":
+                    results = await self.parallel_executor.execute_parallel(
+                        task_type, params, available,
+                    )
+                    # 联系方式类任务合并结果
+                    if task_type in ("search_contacts", "search_freight"):
+                        merged = self.parallel_executor.merge_contact_results(results)
+                        best_entry = max(results, key=lambda r: r["score"])
+                        return await self.process_result(
+                            task_id, task_type, merged, best_entry["ai"],
+                        )
+                    # 其他任务取最高分
+                    best_entry = max(results, key=lambda r: r["score"])
+                    return await self.process_result(
+                        task_id, task_type, best_entry["result"], best_entry["ai"],
+                    )
+
+                elif mode == "race":
+                    best = await self.parallel_executor.execute_race(
+                        task_type, params, available,
+                    )
+                    return await self.process_result(
+                        task_id, task_type, best["result"], best["ai"],
+                    )
+
+                elif mode == "best":
+                    best = await self.parallel_executor.execute_best(
+                        task_type, params, available,
+                    )
+                    return await self.process_result(
+                        task_id, task_type, best["result"], best["ai"],
+                    )
+            except Exception as e:
+                logger.error("并行执行 %s 出错: %s，回退单AI", task_id, e)
+                # 回退到单AI模式继续
+
+        # ── 单AI执行 ────────────────────────────────────
         ai_name = use_ai or "chatgpt"
 
         # 指定的 AI 不在 runners 中 → 自动选
@@ -136,7 +199,6 @@ class BrowserAIClient:
                 "wait_seconds": round(min_wait),
                 "ai_status": status,
             })
-            # 等待后重试
             await asyncio.sleep(min_wait + 1)
             return await self.execute_task(task_id, task_type, params, use_ai=use_ai)
 
@@ -145,7 +207,7 @@ class BrowserAIClient:
             logger.error("无可用AI，任务 %s 放弃", task_id)
             return
 
-        # ── 频率等待 ─────────────────────────────────────
+        # 频率等待
         await self.rate_limiter.wait_if_needed(ai_name)
 
         runner = self.runners[ai_name]
@@ -182,9 +244,7 @@ class BrowserAIClient:
                 print(f"⚠️  未知任务类型: {task_type}")
                 return
 
-            # 记录本次请求
             self.rate_limiter.record_request(ai_name)
-
             await self.process_result(task_id, task_type, result, ai_name)
 
         except Exception as e:
@@ -285,9 +345,11 @@ class BrowserAIClient:
         """启动并进入主循环。"""
         await self.setup()
 
+        mode = self.parallel_executor.get_mode() if self.parallel_executor else "single"
         print("\n" + "=" * 50)
         print("  Browser-AI 就绪")
         print(f"  可用AI: {', '.join(self.controllers.keys()) or '无'}")
+        print(f"  执行模式: {mode}")
         print("=" * 50 + "\n")
 
         # 恢复上次未完成的任务
