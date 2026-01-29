@@ -16,6 +16,7 @@ from core.claude_controller import ClaudeController, ClaudeTaskRunner
 from core.decision_engine import DecisionEngine
 from core.deepseek_controller import DeepSeekController, DeepSeekTaskRunner
 from core.parallel_executor import ParallelExecutor
+from core.personnel_searcher import PersonnelEvaluator, PersonnelSearcher
 from core.quality_checker import QualityChecker
 from core.rate_limiter import RateLimiter
 from core.task_persistence import TaskPersistence
@@ -56,6 +57,8 @@ class BrowserAIClient:
         self.parallel_executor: ParallelExecutor | None = None  # 在 setup 后初始化
         self.task_store = TaskPersistence()
         self.ws_client = WSClient(WS_SERVER_URL)
+        self.personnel_searcher: PersonnelSearcher | None = None
+        self.personnel_evaluator: PersonnelEvaluator | None = None
 
     # ── 启动 ─────────────────────────────────────────────
 
@@ -94,16 +97,26 @@ class BrowserAIClient:
         self.parallel_executor.set_mode(EXECUTION_MODE)
         self.parallel_executor.max_parallel = MAX_PARALLEL
 
-        # 4. 连接 WebSocket
+        # 4. 初始化人员搜索器和评估器
+        self.personnel_searcher = PersonnelSearcher(
+            self.controllers, self.browser_manager,
+        )
+        # 使用第一个可用的AI控制器作为评估器
+        if self.controllers:
+            first_ai = next(iter(self.controllers.values()))
+            self.personnel_evaluator = PersonnelEvaluator(first_ai)
+
+        # 5. 连接 WebSocket
         await self.ws_client.connect()
 
-        # 5. 注册消息处理器
+        # 6. 注册消息处理器
         self.ws_client.on("new_task", self.handle_new_task)
         self.ws_client.on("retry_task", self.handle_retry_task)
         self.ws_client.on("review_result", self.handle_review_result)
         self.ws_client.on("config_update", self.handle_config_update)
+        self.ws_client.on("personnel_search", self.handle_personnel_search)
 
-        # 6. 请求服务器配置
+        # 7. 请求服务器配置
         await self.ws_client.request_config()
 
     # ── 任务处理 ──────────────────────────────────────────
@@ -302,6 +315,84 @@ class BrowserAIClient:
                 best if best is not None else result,
                 score, decision["issues"], summary,
             )
+
+    # ── 人员搜索处理 ────────────────────────────────────
+
+    async def handle_personnel_search(self, message: dict):
+        """处理人员搜索任务。"""
+        data = message.get("data", {})
+        task_id = data.get("task_id", "unknown")
+        search_type = data.get("type")  # freight_forwarder/inspection_company/freelancer
+        country = data.get("country", "")
+        city = data.get("city")
+
+        print(f"\n🔍 收到人员搜索任务: {task_id} ({search_type})")
+        logger.info("人员搜索任务: %s, 类型: %s, 地区: %s %s", task_id, search_type, country, city or "")
+
+        if not self.personnel_searcher:
+            logger.error("人员搜索器未初始化")
+            await self.ws_client.send("personnel_search_error", {
+                "search_task_id": task_id,
+                "error": "人员搜索器未初始化",
+            })
+            return
+
+        try:
+            # 1. 执行搜索
+            print(f"  正在搜索 {search_type}...")
+            types = [search_type] if search_type else None
+            results = await self.personnel_searcher.search_all(country, city, types)
+
+            # 合并所有类型的结果
+            all_results = []
+            for type_name, type_results in results.items():
+                all_results.extend(type_results)
+
+            print(f"  找到 {len(all_results)} 个结果")
+
+            # 2. AI评估每个结果
+            evaluated = []
+            if self.personnel_evaluator and all_results:
+                print(f"  正在评估结果...")
+                evaluated = await self.personnel_evaluator.evaluate_batch(
+                    all_results, search_type or "unknown",
+                )
+            else:
+                evaluated = all_results
+
+            # 3. 发送结果到服务器
+            await self.ws_client.send("personnel_search_result", {
+                "search_task_id": task_id,
+                "results": evaluated,
+                "total_count": len(evaluated),
+                "search_type": search_type,
+                "country": country,
+                "city": city,
+            })
+
+            # 4. 高分结果通知Telegram
+            high_score = [r for r in evaluated if r.get("ai_score", 0) >= 70]
+            if high_score:
+                print(f"  ✅ 发现 {len(high_score)} 个高分结果")
+                await self.ws_client.send("notify_personnel_found", {
+                    "search_task_id": task_id,
+                    "count": len(high_score),
+                    "top_result": high_score[0],
+                    "search_type": search_type,
+                })
+            else:
+                print(f"  ⚠️  未发现高分结果")
+
+            logger.info("人员搜索完成: %s, 共 %d 个结果, 高分 %d 个",
+                        task_id, len(evaluated), len(high_score))
+
+        except Exception as e:
+            logger.error("人员搜索失败: %s - %s", task_id, e)
+            print(f"  ❌ 搜索失败: {e}")
+            await self.ws_client.send("personnel_search_error", {
+                "search_task_id": task_id,
+                "error": str(e),
+            })
 
     # ── 服务器指令处理 ───────────────────────────────────
 
