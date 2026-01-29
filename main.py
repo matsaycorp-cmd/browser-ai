@@ -3,7 +3,13 @@
 import asyncio
 import logging
 
-from config.settings import BROWSER_DATA_DIR, EXECUTION_MODE, MAX_PARALLEL, WS_SERVER_URL
+from config.settings import (
+    BROWSER_DATA_DIR,
+    EXECUTION_MODE,
+    MAX_PARALLEL,
+    WS_SERVER_URL,
+    config_manager,
+)
 from core.browser_manager import BrowserManager
 from core.chatgpt_controller import ChatGPTController, ChatGPTTaskRunner
 from core.claude_controller import ClaudeController, ClaudeTaskRunner
@@ -95,6 +101,10 @@ class BrowserAIClient:
         self.ws_client.on("new_task", self.handle_new_task)
         self.ws_client.on("retry_task", self.handle_retry_task)
         self.ws_client.on("review_result", self.handle_review_result)
+        self.ws_client.on("config_update", self.handle_config_update)
+
+        # 6. 请求服务器配置
+        await self.ws_client.request_config()
 
     # ── 任务处理 ──────────────────────────────────────────
 
@@ -321,6 +331,37 @@ class BrowserAIClient:
             print(f"❌ 审核拒绝: {task_id} ({reason})")
             logger.info("任务 %s 审核拒绝: %s", task_id, reason)
             self.decision_engine.reset_task(task_id)
+
+    async def handle_config_update(self, message: dict):
+        """处理服务器下发的配置更新。"""
+        data = message.get("data", {})
+        if not data:
+            return
+
+        print("⚙️ 收到配置更新")
+        logger.info("收到服务器配置更新: %s", list(data.keys()))
+
+        # 更新全局配置管理器
+        config_manager.batch_update(data)
+
+        # 同步到各组件
+        if "rate_limits" in data:
+            self.rate_limiter.reload_config(data["rate_limits"])
+
+        if "execution_mode" in data or "max_parallel" in data:
+            if self.parallel_executor:
+                self.parallel_executor.reload_config(
+                    execution_mode=data.get("execution_mode"),
+                    max_parallel=data.get("max_parallel"),
+                )
+
+        if any(k in data for k in ("auto_approve_score", "min_pass_score", "max_retry_rounds", "ai_retry_order")):
+            self.decision_engine.reload_config(
+                auto_approve_score=data.get("auto_approve_score"),
+                min_pass_score=data.get("min_pass_score"),
+                max_retry_rounds=data.get("max_retry_rounds"),
+                ai_retry_order=data.get("ai_retry_order"),
+            )
 
     # ── 任务恢复 ──────────────────────────────────────────
 

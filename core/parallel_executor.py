@@ -50,6 +50,14 @@ class ParallelExecutor:
     def get_mode(self) -> str:
         return self.mode
 
+    def reload_config(self, execution_mode: str | None = None, max_parallel: int | None = None):
+        """从 ConfigManager 重新加载配置。"""
+        if execution_mode is not None:
+            self.set_mode(execution_mode)
+        if max_parallel is not None:
+            self.max_parallel = max_parallel
+            logger.info("max_parallel 已更新为: %d", max_parallel)
+
     def select_execution_mode(self, task_type: str) -> str:
         """根据任务类型推荐执行模式。"""
         return RECOMMENDED_MODES.get(task_type, "single")

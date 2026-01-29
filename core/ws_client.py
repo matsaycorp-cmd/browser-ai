@@ -112,6 +112,11 @@ class WSClient:
         """发送状态更新（当前任务、AI在线状态等）。"""
         await self.send("status_update", status_data)
 
+    async def request_config(self):
+        """向服务器请求最新配置。"""
+        await self.send("request_config", {"client": "browser-ai"})
+        logger.info("已请求服务器配置")
+
     # ── 回调注册 & 监听 ──────────────────────────────────
 
     def on(self, message_type: str, callback):

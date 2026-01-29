@@ -24,6 +24,25 @@ class RateLimiter:
         self.request_history: dict[str, list[float]] = {}
         self.last_request: dict[str, float] = {}
 
+    def reload_config(self, rate_limits: dict):
+        """从 ConfigManager 重新加载速率限制配置。"""
+        for ai_name, cfg in rate_limits.items():
+            if ai_name in self.limits:
+                self.limits[ai_name].update(cfg)
+            else:
+                self.limits[ai_name] = dict(cfg)
+        logger.info("速率限制配置已更新: %s", list(rate_limits.keys()))
+
+    def update_limit(self, ai_name: str, per_hour: int | None = None, min_interval: int | None = None):
+        """更新单个 AI 的速率限制。"""
+        if ai_name not in self.limits:
+            self.limits[ai_name] = {"per_hour": 50, "min_interval": 8}
+        if per_hour is not None:
+            self.limits[ai_name]["per_hour"] = per_hour
+        if min_interval is not None:
+            self.limits[ai_name]["min_interval"] = min_interval
+        logger.info("%s 速率限制已更新: %s", ai_name, self.limits[ai_name])
+
     # ── 等待 & 检查 ──────────────────────────────────────
 
     async def wait_if_needed(self, ai_name: str):

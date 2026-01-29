@@ -25,6 +25,27 @@ class DecisionEngine:
         self.ai_retry_order = list(AI_RETRY_ORDER)
         self.task_history: dict[str, dict] = {}
 
+    def reload_config(
+        self,
+        auto_approve_score: int | None = None,
+        min_pass_score: int | None = None,
+        max_retry_rounds: int | None = None,
+        ai_retry_order: list | None = None,
+    ):
+        """从 ConfigManager 重新加载配置。"""
+        if auto_approve_score is not None:
+            self.auto_approve_score = auto_approve_score
+        if min_pass_score is not None:
+            self.min_pass_score = min_pass_score
+        if max_retry_rounds is not None:
+            self.max_retry_rounds = max_retry_rounds
+        if ai_retry_order is not None:
+            self.ai_retry_order = list(ai_retry_order)
+        logger.info(
+            "决策引擎配置已更新: auto=%d, min=%d, max_retry=%d",
+            self.auto_approve_score, self.min_pass_score, self.max_retry_rounds,
+        )
+
     # ── 主入口 ────────────────────────────────────────────
 
     def evaluate(self, task_id: str, task_type: str, result, current_ai: str) -> dict:
