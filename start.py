@@ -50,7 +50,9 @@ def show_menu():
     print("  2. 仅测试连接")
     print("  3. 仅登录AI（不执行任务）")
     print("  4. 查看配置")
-    print("  5. 退出")
+    print("  5. 测试对抗验证系统")
+    print("  6. 调试工具")
+    print("  0. 退出")
     print()
     print("=" * 40)
 
@@ -133,6 +135,24 @@ async def run_login_mode():
         print(f"\n❌ 登录失败: {e}")
 
 
+async def run_debate_test():
+    """运行对抗验证测试。"""
+    try:
+        from test_debate import interactive_menu
+        await interactive_menu()
+    except Exception as e:
+        print(f"\n❌ 对抗测试失败: {e}")
+
+
+def run_debug_tool():
+    """运行调试工具。"""
+    try:
+        from debug_debate import interactive_debug_menu
+        interactive_debug_menu()
+    except Exception as e:
+        print(f"\n❌ 调试工具失败: {e}")
+
+
 def main():
     """主函数。"""
     print("\n🔍 正在检查环境...")
@@ -163,7 +183,7 @@ def main():
     # 主循环
     while True:
         show_menu()
-        choice = input("请选择 (1-5): ").strip()
+        choice = input("请选择 (0-6): ").strip()
 
         if choice == "1":
             asyncio.run(run_full_program())
@@ -177,10 +197,16 @@ def main():
             show_config()
             input("\n按 Enter 键返回菜单...")
         elif choice == "5":
+            asyncio.run(run_debate_test())
+            input("\n按 Enter 键返回菜单...")
+        elif choice == "6":
+            run_debug_tool()
+            input("\n按 Enter 键返回菜单...")
+        elif choice == "0":
             print("\n👋 再见！\n")
             break
         else:
-            print("\n⚠️  无效选择，请输入 1-5")
+            print("\n⚠️  无效选择，请输入 0-6")
 
 
 if __name__ == "__main__":
