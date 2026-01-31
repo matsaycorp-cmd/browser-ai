@@ -1,7 +1,9 @@
 # 主程序入口
 
 import asyncio
+import json
 import logging
+import re
 
 from config.settings import (
     BROWSER_DATA_DIR,
@@ -13,6 +15,7 @@ from config.settings import (
 from core.browser_manager import BrowserManager
 from core.chatgpt_controller import ChatGPTController, ChatGPTTaskRunner
 from core.claude_controller import ClaudeController, ClaudeTaskRunner
+from core.debate_system import AgentRole, DebateOrchestrator
 from core.decision_engine import DecisionEngine
 from core.deepseek_controller import DeepSeekController, DeepSeekTaskRunner
 from core.parallel_executor import ParallelExecutor
@@ -59,6 +62,7 @@ class BrowserAIClient:
         self.ws_client = WSClient(WS_SERVER_URL)
         self.personnel_searcher: PersonnelSearcher | None = None
         self.personnel_evaluator: PersonnelEvaluator | None = None
+        self.debate_orchestrator: DebateOrchestrator | None = None
 
     # ── 启动 ─────────────────────────────────────────────
 
@@ -106,17 +110,24 @@ class BrowserAIClient:
             first_ai = next(iter(self.controllers.values()))
             self.personnel_evaluator = PersonnelEvaluator(first_ai)
 
-        # 5. 连接 WebSocket
+        # 5. 初始化对抗验证编排器
+        if self.controllers:
+            self.debate_orchestrator = DebateOrchestrator(self.controllers)
+            self.decision_engine.set_debate_orchestrator(self.debate_orchestrator)
+            print("✅ 对抗验证系统已初始化")
+
+        # 6. 连接 WebSocket
         await self.ws_client.connect()
 
-        # 6. 注册消息处理器
+        # 7. 注册消息处理器
         self.ws_client.on("new_task", self.handle_new_task)
         self.ws_client.on("retry_task", self.handle_retry_task)
         self.ws_client.on("review_result", self.handle_review_result)
         self.ws_client.on("config_update", self.handle_config_update)
         self.ws_client.on("personnel_search", self.handle_personnel_search)
+        self.ws_client.on("debate_task", self.handle_debate_task)
 
-        # 7. 请求服务器配置
+        # 8. 请求服务器配置
         await self.ws_client.request_config()
 
     # ── 任务处理 ──────────────────────────────────────────
@@ -393,6 +404,512 @@ class BrowserAIClient:
                 "search_task_id": task_id,
                 "error": str(e),
             })
+
+    # ── 对抗验证处理 ────────────────────────────────────
+
+    async def handle_debate_task(self, message: dict):
+        """处理对抗验证任务。"""
+        data = message.get("data", {})
+        session_id = data.get("session_id", "unknown")
+        task_type = data.get("task_type", "")
+        params = data.get("params", {})
+
+        print(f"\n⚔️ 收到对抗验证任务: {session_id} ({task_type})")
+        logger.info("对抗验证任务: %s, 类型: %s", session_id, task_type)
+
+        if not self.debate_orchestrator:
+            logger.error("对抗验证编排器未初始化")
+            await self.ws_client.send("debate_failed", {
+                "session_id": session_id,
+                "error": "对抗验证系统未初始化",
+            })
+            return
+
+        try:
+            # 1. 通知开始
+            await self.ws_client.send("debate_progress", {
+                "session_id": session_id,
+                "status": "started",
+                "message": "对抗验证开始",
+            })
+
+            # 2. 根据任务类型执行对抗
+            if task_type == "contact_discovery":
+                result = await self._debate_contact_discovery(
+                    session_id,
+                    params.get("company_name", ""),
+                    params.get("country", ""),
+                    params.get("city"),
+                )
+            elif task_type == "personnel_verification":
+                result = await self._debate_personnel_verification(
+                    session_id,
+                    params.get("personnel_info", {}),
+                )
+            elif task_type == "slaughterhouse_verification":
+                result = await self._debate_slaughterhouse_verification(
+                    session_id,
+                    params.get("slaughterhouse_info", {}),
+                )
+            else:
+                raise ValueError(f"未知的对抗任务类型: {task_type}")
+
+            # 3. 发送最终结果
+            print(f"  ✅ 对抗验证完成: {session_id}")
+            await self.ws_client.send("debate_complete", {
+                "session_id": session_id,
+                "final_result": result,
+            })
+
+        except Exception as e:
+            logger.error("对抗验证失败: %s - %s", session_id, e)
+            print(f"  ❌ 对抗验证失败: {e}")
+            await self.ws_client.send("debate_failed", {
+                "session_id": session_id,
+                "error": str(e),
+            })
+
+    async def _debate_contact_discovery(
+        self,
+        session_id: str,
+        company_name: str,
+        country: str,
+        city: str | None = None,
+    ) -> dict:
+        """联系方式发现的对抗验证。"""
+        print(f"  📍 联系方式对抗验证: {company_name} ({country})")
+
+        finder = self.debate_orchestrator.agents.get(AgentRole.FINDER)
+        critic = self.debate_orchestrator.agents.get(AgentRole.CRITIC)
+        verifier = self.debate_orchestrator.agents.get(AgentRole.VERIFIER)
+        judge = self.debate_orchestrator.agents.get(AgentRole.JUDGE)
+
+        # === 第1轮：Finder ===
+        await self._notify_round_start(session_id, 1, "finder")
+        finder_result = await finder.find_contacts(company_name, country)
+        await self._notify_round_complete(session_id, 1, "finder", finder_result)
+
+        # === 第2轮：Critic ===
+        await self._notify_round_start(session_id, 2, "critic")
+        critic_result = await critic.critique(finder_result, company_name, country)
+        await self._notify_round_complete(session_id, 2, "critic", critic_result)
+
+        # === 第3轮：Verifier ===
+        await self._notify_round_start(session_id, 3, "verifier")
+        verifier_result = await verifier.verify(
+            finder_result, critic_result, company_name, country,
+        )
+        await self._notify_round_complete(session_id, 3, "verifier", verifier_result)
+
+        # === 第4轮：Judge ===
+        await self._notify_round_start(session_id, 4, "judge")
+        judge_result = await judge.judge(
+            finder_result, critic_result, verifier_result, company_name,
+        )
+        await self._notify_round_complete(session_id, 4, "judge", judge_result)
+
+        return {
+            "rounds": {
+                "finder": finder_result,
+                "critic": critic_result,
+                "verifier": verifier_result,
+                "judge": judge_result,
+            },
+            "final_decision": judge_result.get("final_decision"),
+            "overall_confidence": judge_result.get("overall_confidence"),
+            "needs_human_review": judge_result.get("needs_human_review"),
+            "summary": judge_result.get("summary", ""),
+        }
+
+    async def _debate_personnel_verification(
+        self,
+        session_id: str,
+        personnel_info: dict,
+    ) -> dict:
+        """验货人员的对抗验证。"""
+        name = personnel_info.get("name", "Unknown")
+        company = personnel_info.get("company", "")
+        country = personnel_info.get("country", "")
+        platform = personnel_info.get("platform", "")
+
+        print(f"  👤 人员对抗验证: {name} ({company})")
+
+        finder = self.debate_orchestrator.agents.get(AgentRole.FINDER)
+        critic = self.debate_orchestrator.agents.get(AgentRole.CRITIC)
+        verifier = self.debate_orchestrator.agents.get(AgentRole.VERIFIER)
+        judge = self.debate_orchestrator.agents.get(AgentRole.JUDGE)
+
+        # === 第1轮：Finder 搜索更多信息 ===
+        await self._notify_round_start(session_id, 1, "finder")
+
+        finder_prompt = f"""请搜索以下人员/公司的更多信息：
+
+名称：{name}
+公司：{company}
+国家：{country}
+来源平台：{platform}
+
+需要找到：
+1. 公司官网或个人主页
+2. 社交媒体账号（LinkedIn、Facebook等）
+3. 其他平台的评价
+4. 新闻报道或公开信息
+5. 公司注册信息（如果是公司）
+
+请返回JSON格式：
+{{
+  "official_sources": ["来源1", ...],
+  "social_media": ["账号1", ...],
+  "reviews": ["评价1", ...],
+  "news": ["新闻1", ...],
+  "registration_info": "注册信息",
+  "other_findings": ["其他发现", ...]
+}}"""
+
+        await finder.controller.send_message(finder_prompt)
+        await finder.controller.wait_response()
+        finder_response = await finder.controller.get_last_response()
+        finder_result = {"raw": finder_response, "parsed": self._parse_json(finder_response)}
+        await self._notify_round_complete(session_id, 1, "finder", finder_result)
+
+        # === 第2轮：Critic 质疑可信度 ===
+        await self._notify_round_start(session_id, 2, "critic")
+
+        critic_prompt = f"""你是风险评估专家。请严格审查以下验货人员的可信度：
+
+基本信息：
+{json.dumps(personnel_info, ensure_ascii=False, indent=2)}
+
+搜索到的额外信息：
+{finder_response}
+
+请从以下角度质疑：
+
+1. 身份真实性：
+   - 名称是否像真实人名/公司名？
+   - 是否有可验证的身份证明？
+   - 社交媒体账号是否活跃？
+
+2. 能力可信度：
+   - 声称的经验是否合理？
+   - 评价是否可能是刷单？
+   - 价格是否异常（太低可能是骗子）？
+
+3. 风险信号：
+   - 是否有负面信息？
+   - 是否有投诉或纠纷？
+   - 信息是否前后矛盾？
+
+4. 地理匹配：
+   - 位置是否与声称一致？
+   - 是否有能力在当地执行任务？
+
+请返回JSON格式：
+{{
+  "identity_concerns": ["担忧1", ...],
+  "capability_concerns": ["担忧1", ...],
+  "risk_signals": ["信号1", ...],
+  "questions_to_verify": ["需验证问题1", ...],
+  "initial_risk_level": "low/medium/high",
+  "recommendation": "可信/谨慎/不可信"
+}}"""
+
+        await critic.controller.send_message(critic_prompt)
+        await critic.controller.wait_response()
+        critic_response = await critic.controller.get_last_response()
+        critic_result = {"raw": critic_response, "parsed": self._parse_json(critic_response)}
+        await self._notify_round_complete(session_id, 2, "critic", critic_result)
+
+        # === 第3轮：Verifier 验证证据 ===
+        await self._notify_round_start(session_id, 3, "verifier")
+
+        verifier_prompt = f"""请验证以下关于验货人员的信息：
+
+人员信息：
+{json.dumps(personnel_info, ensure_ascii=False, indent=2)}
+
+批评者的质疑：
+{critic_response}
+
+请尝试验证：
+
+1. 如果是公司：
+   - 搜索公司注册信息
+   - 查找官网是否真实存在
+   - 验证地址是否真实
+
+2. 如果是个人：
+   - LinkedIn是否有此人
+   - 平台评价是否真实
+   - 历史记录是否合理
+
+3. 对批评者的质疑逐一回应
+
+请返回JSON格式：
+{{
+  "verifications": [
+    {{"item": "被验证项", "result": "verified/unverified/uncertain", "evidence": "证据", "source_url": "来源"}}
+  ],
+  "identity_confirmed": true/false/"uncertain",
+  "overall_assessment": "可信度评估",
+  "evidence_strength": "strong/moderate/weak"
+}}"""
+
+        await verifier.controller.send_message(verifier_prompt)
+        await verifier.controller.wait_response()
+        verifier_response = await verifier.controller.get_last_response()
+        verifier_result = {"raw": verifier_response, "parsed": self._parse_json(verifier_response)}
+        await self._notify_round_complete(session_id, 3, "verifier", verifier_result)
+
+        # === 第4轮：Judge 最终判定 ===
+        await self._notify_round_start(session_id, 4, "judge")
+
+        judge_prompt = f"""请作为最终裁判，综合以下信息对验货人员做出判定：
+
+原始信息：
+{json.dumps(personnel_info, ensure_ascii=False, indent=2)}
+
+Finder搜索结果：
+{finder_response}
+
+Critic质疑：
+{critic_response}
+
+Verifier验证：
+{verifier_response}
+
+请做出最终判定，返回JSON格式：
+{{
+  "final_verdict": "approve/reject/need_more_info",
+  "confidence": 0-100,
+  "risk_level": "low/medium/high",
+  "credit_score_suggestion": 0-100,
+  "max_cargo_value_suggestion": 建议最高货值美元,
+  "requires_deposit": true/false,
+  "deposit_amount_suggestion": 建议押金美元,
+  "key_risks": ["主要风险1", ...],
+  "key_strengths": ["主要优点1", ...],
+  "conditions": ["使用条件1", ...],
+  "summary": "一句话总结"
+}}"""
+
+        await judge.controller.send_message(judge_prompt)
+        await judge.controller.wait_response()
+        judge_response = await judge.controller.get_last_response()
+        judge_result = {"raw": judge_response, "parsed": self._parse_json(judge_response)}
+        await self._notify_round_complete(session_id, 4, "judge", judge_result)
+
+        return {
+            "rounds": {
+                "finder": finder_result,
+                "critic": critic_result,
+                "verifier": verifier_result,
+                "judge": judge_result,
+            },
+            "final_verdict": judge_result.get("parsed", {}),
+        }
+
+    async def _debate_slaughterhouse_verification(
+        self,
+        session_id: str,
+        slaughterhouse_info: dict,
+    ) -> dict:
+        """屠宰场信息的对抗验证。"""
+        name = slaughterhouse_info.get("name", "Unknown")
+        country = slaughterhouse_info.get("country", "")
+        website = slaughterhouse_info.get("website", "")
+
+        print(f"  🏭 屠宰场对抗验证: {name} ({country})")
+
+        finder = self.debate_orchestrator.agents.get(AgentRole.FINDER)
+        critic = self.debate_orchestrator.agents.get(AgentRole.CRITIC)
+        verifier = self.debate_orchestrator.agents.get(AgentRole.VERIFIER)
+        judge = self.debate_orchestrator.agents.get(AgentRole.JUDGE)
+
+        # === 第1轮：Finder 搜索屠宰场信息 ===
+        await self._notify_round_start(session_id, 1, "finder")
+
+        finder_prompt = f"""请搜索以下屠宰场的详细信息：
+
+名称：{name}
+国家：{country}
+网站：{website}
+
+需要找到：
+1. 公司注册信息
+2. 出口资质/认证（如SIF、HALAL等）
+3. 产品类型（是否有牛产品/牛黄）
+4. 规模（员工数、产能）
+5. 客户评价或行业口碑
+6. 新闻报道
+7. 是否有出口到中国/香港的记录
+
+返回JSON格式的搜索结果。"""
+
+        await finder.controller.send_message(finder_prompt)
+        await finder.controller.wait_response()
+        finder_response = await finder.controller.get_last_response()
+        finder_result = {"raw": finder_response, "parsed": self._parse_json(finder_response)}
+        await self._notify_round_complete(session_id, 1, "finder", finder_result)
+
+        # === 第2轮：Critic 质疑 ===
+        await self._notify_round_start(session_id, 2, "critic")
+
+        critic_prompt = f"""你是屠宰场审核专家。请质疑以下屠宰场的可信度：
+
+屠宰场信息：
+{json.dumps(slaughterhouse_info, ensure_ascii=False, indent=2)}
+
+搜索结果：
+{finder_response}
+
+请从以下角度质疑：
+
+1. 真实性：是否是真正的屠宰场？网站是否正规？是否有营业执照？
+
+2. 产品匹配：是否确实加工牛产品？是否有能力/意愿提供牛黄？规模是否合理？
+
+3. 出口能力：是否有出口资质？是否有国际贸易经验？
+
+4. 风险信号：是否有质量问题历史？是否有法律纠纷？价格是否合理？
+
+返回JSON格式评估。"""
+
+        await critic.controller.send_message(critic_prompt)
+        await critic.controller.wait_response()
+        critic_response = await critic.controller.get_last_response()
+        critic_result = {"raw": critic_response, "parsed": self._parse_json(critic_response)}
+        await self._notify_round_complete(session_id, 2, "critic", critic_result)
+
+        # === 第3轮：Verifier 验证 ===
+        await self._notify_round_start(session_id, 3, "verifier")
+
+        verifier_prompt = f"""请验证以下屠宰场信息：
+
+{json.dumps(slaughterhouse_info, ensure_ascii=False, indent=2)}
+
+批评者质疑：
+{critic_response}
+
+请验证：
+1. 官网真实性
+2. 公司注册记录
+3. 出口认证（如SIF、HALAL等）
+4. 行业协会会员资格
+5. 海关出口记录（如能找到）
+
+返回JSON格式验证结果。"""
+
+        await verifier.controller.send_message(verifier_prompt)
+        await verifier.controller.wait_response()
+        verifier_response = await verifier.controller.get_last_response()
+        verifier_result = {"raw": verifier_response, "parsed": self._parse_json(verifier_response)}
+        await self._notify_round_complete(session_id, 3, "verifier", verifier_result)
+
+        # === 第4轮：Judge 判定 ===
+        await self._notify_round_start(session_id, 4, "judge")
+
+        judge_prompt = f"""综合判定此屠宰场是否值得联系：
+
+信息：{json.dumps(slaughterhouse_info, ensure_ascii=False, indent=2)}
+搜索：{finder_response}
+质疑：{critic_response}
+验证：{verifier_response}
+
+返回JSON格式：
+{{
+  "verdict": "worth_contact/uncertain/skip",
+  "confidence": 0-100,
+  "priority": "high/medium/low",
+  "estimated_potential": "high/medium/low",
+  "key_risks": [...],
+  "recommended_approach": "建议的联系方式",
+  "summary": "一句话总结"
+}}"""
+
+        await judge.controller.send_message(judge_prompt)
+        await judge.controller.wait_response()
+        judge_response = await judge.controller.get_last_response()
+        judge_result = {"raw": judge_response, "parsed": self._parse_json(judge_response)}
+        await self._notify_round_complete(session_id, 4, "judge", judge_result)
+
+        return {
+            "rounds": {
+                "finder": finder_result,
+                "critic": critic_result,
+                "verifier": verifier_result,
+                "judge": judge_result,
+            },
+            "final_verdict": judge_result.get("parsed", {}),
+        }
+
+    async def _notify_round_start(self, session_id: str, round_num: int, agent_role: str):
+        """通知轮次开始。"""
+        role_names = {
+            "finder": "🔍 发现者",
+            "critic": "🔴 批评者",
+            "verifier": "✅ 验证者",
+            "judge": "⚖️ 裁判",
+        }
+        print(f"    第{round_num}轮: {role_names.get(agent_role, agent_role)} 开始...")
+
+        await self.ws_client.send("debate_round_start", {
+            "session_id": session_id,
+            "round": round_num,
+            "agent": agent_role,
+            "status": "running",
+        })
+
+    async def _notify_round_complete(
+        self,
+        session_id: str,
+        round_num: int,
+        agent_role: str,
+        result: dict,
+    ):
+        """通知轮次完成。"""
+        print(f"    第{round_num}轮: {agent_role} 完成")
+
+        # 移除原始响应以减小传输大小
+        result_summary = {k: v for k, v in result.items() if k != "raw"}
+
+        await self.ws_client.send("debate_round_complete", {
+            "session_id": session_id,
+            "round": round_num,
+            "agent": agent_role,
+            "result": result_summary,
+            "status": "completed",
+        })
+
+    def _parse_json(self, text: str) -> dict:
+        """从AI回复中提取JSON。"""
+        if not text:
+            return {"parse_error": True, "raw_text": ""}
+
+        # 尝试直接解析
+        try:
+            return json.loads(text)
+        except json.JSONDecodeError:
+            pass
+
+        # 尝试提取```json```块
+        match = re.search(r'```json\s*(.*?)\s*```', text, re.DOTALL)
+        if match:
+            try:
+                return json.loads(match.group(1))
+            except json.JSONDecodeError:
+                pass
+
+        # 尝试提取{...}
+        match = re.search(r'\{.*\}', text, re.DOTALL)
+        if match:
+            try:
+                return json.loads(match.group(0))
+            except json.JSONDecodeError:
+                pass
+
+        # 解析失败，返回原始文本
+        return {"raw_text": text[:500], "parse_error": True}
 
     # ── 服务器指令处理 ───────────────────────────────────
 

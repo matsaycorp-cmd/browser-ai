@@ -32,6 +32,27 @@ RATE_LIMITS = {
     "gemini": {"per_hour": 40, "min_interval": 8},
 }
 
+# 对抗验证配置
+DEBATE_CONFIG = {
+    "enabled": True,                     # 是否启用对抗验证
+    "default_agents": {                  # 默认Agent分配
+        "finder": "chatgpt",             # 发现者：擅长搜索
+        "critic": "claude",              # 批评者：擅长分析
+        "verifier": "deepseek",          # 验证者：擅长中文
+        "judge": "claude",               # 裁判：擅长综合判断
+    },
+    "timeout_per_round": 120,            # 每轮超时秒数
+    "retry_on_failure": True,            # Agent失败时是否重试
+    "max_retries": 2,                    # 最大重试次数
+    "parallel_mode": False,              # Critic和Verifier是否并行
+    "min_value_threshold": 500,          # 货值超过此值才启用对抗验证
+    "confidence_threshold": {            # 置信度阈值
+        "auto_approve": 85,              # 自动通过
+        "human_review": 60,              # 需要人工复核
+        "auto_reject": 30,               # 自动拒绝
+    },
+}
+
 
 class ConfigManager:
     """动态配置管理器，支持服务器下发配置更新。"""
@@ -49,6 +70,7 @@ class ConfigManager:
             "execution_mode": EXECUTION_MODE,
             "max_parallel": MAX_PARALLEL,
             "rate_limits": dict(RATE_LIMITS),
+            "debate_config": dict(DEBATE_CONFIG),
         }
 
     def update(self, key: str, value):
