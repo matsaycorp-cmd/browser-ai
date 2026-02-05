@@ -82,7 +82,7 @@ class DeepSeekController:
         count = await messages.count()
 
         if count == 0:
-            messages = self.page.locator('div[class*="message"]div[class*="assistant"]')
+            messages = self.page.locator('div[class*="message"] div[class*="assistant"]')
             count = await messages.count()
 
         if count == 0:
