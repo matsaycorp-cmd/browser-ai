@@ -5,7 +5,7 @@ import logging
 
 from playwright.async_api import async_playwright
 
-from config.settings import AI_URLS
+from config.settings import AI_URLS, PROXY_CONFIG
 
 logger = logging.getLogger(__name__)
 
@@ -30,11 +30,24 @@ class BrowserManager:
     async def start(self, headless: bool = False):
         """启动 Playwright 并用持久化上下文打开 Chromium。"""
         self.playwright = await async_playwright().start()
+
+        # 构建启动参数
+        launch_options = {
+            "user_data_dir": self.data_dir,
+            "headless": headless,
+            "viewport": {"width": 1280, "height": 800},
+            "args": ["--disable-blink-features=AutomationControlled"],
+        }
+
+        # 添加代理配置（如果启用）
+        if PROXY_CONFIG.get("enabled"):
+            proxy_server = PROXY_CONFIG.get("server")
+            if proxy_server:
+                launch_options["proxy"] = {"server": proxy_server}
+                logger.info("已配置代理: %s", proxy_server)
+
         self.browser = await self.playwright.chromium.launch_persistent_context(
-            user_data_dir=self.data_dir,
-            headless=headless,
-            viewport={"width": 1280, "height": 800},
-            args=["--disable-blink-features=AutomationControlled"],
+            **launch_options
         )
         logger.info("浏览器已启动 (headless=%s)", headless)
 

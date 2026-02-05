@@ -1,6 +1,12 @@
 # WebSocket服务器地址
 WS_SERVER_URL = "ws://localhost:8765"
 
+# 代理配置（Clash/V2Ray等）
+PROXY_CONFIG = {
+    "enabled": True,                    # 是否启用代理
+    "server": "http://127.0.0.1:7890",  # 代理服务器地址
+}
+
 # AI平台URL
 AI_URLS = {
     "chatgpt": "https://chat.openai.com",
