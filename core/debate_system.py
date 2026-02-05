@@ -48,7 +48,7 @@ class DebateAgent:
 
         Args:
             role: AgentRole枚举
-            controller: AI控制器（ChatGPT/Claude/DeepSeek）
+            controller: AI控制器（ChatGPT/Claude/Gemini）
             name: 显示名称
         """
         self.role = role
@@ -752,12 +752,12 @@ class DebateOrchestrator:
         # 默认分配策略
         # Finder: ChatGPT（擅长搜索）
         # Critic: Claude（擅长分析）
-        # Verifier: DeepSeek（擅长中文）或 ChatGPT
+        # Verifier: Gemini
         # Judge: Claude（擅长综合判断）
 
         finder_ai = "chatgpt" if "chatgpt" in available else available[0]
         critic_ai = "claude" if "claude" in available else available[0]
-        verifier_ai = "deepseek" if "deepseek" in available else (
+        verifier_ai = "gemini" if "gemini" in available else (
             "chatgpt" if "chatgpt" in available else available[0]
         )
         judge_ai = "claude" if "claude" in available else available[0]

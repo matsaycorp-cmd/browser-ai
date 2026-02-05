@@ -11,7 +11,6 @@ PROXY_CONFIG = {
 AI_URLS = {
     "chatgpt": "https://chat.openai.com",
     "claude": "https://claude.ai",
-    "deepseek": "https://chat.deepseek.com",
     "gemini": "https://gemini.google.com",
 }
 
@@ -23,8 +22,8 @@ AUTO_APPROVE_SCORE = 85  # 自动通过分数
 MIN_PASS_SCORE = 70      # 最低通过分数
 
 # 重试配置
-MAX_RETRY_ROUNDS = 4  # 最大重试轮数
-AI_RETRY_ORDER = ["chatgpt", "claude", "deepseek", "gemini"]  # 重试顺序
+MAX_RETRY_ROUNDS = 3  # 最大重试轮数
+AI_RETRY_ORDER = ["chatgpt", "claude", "gemini"]  # 重试顺序
 
 # 执行模式: "single" | "parallel" | "race" | "best"
 EXECUTION_MODE = "single"
@@ -34,7 +33,6 @@ MAX_PARALLEL = 2  # 最多同时运行的AI数量
 RATE_LIMITS = {
     "chatgpt": {"per_hour": 50, "min_interval": 8},
     "claude": {"per_hour": 40, "min_interval": 10},
-    "deepseek": {"per_hour": 60, "min_interval": 5},
     "gemini": {"per_hour": 40, "min_interval": 8},
 }
 
@@ -44,7 +42,7 @@ DEBATE_CONFIG = {
     "default_agents": {                  # 默认Agent分配
         "finder": "chatgpt",             # 发现者：擅长搜索
         "critic": "claude",              # 批评者：擅长分析
-        "verifier": "deepseek",          # 验证者：擅长中文
+        "verifier": "gemini",            # 验证者
         "judge": "claude",               # 裁判：擅长综合判断
     },
     "timeout_per_round": 120,            # 每轮超时秒数

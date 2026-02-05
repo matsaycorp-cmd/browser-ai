@@ -13,7 +13,6 @@ logger = logging.getLogger(__name__)
 LOGIN_SELECTORS = {
     "chatgpt": "#prompt-textarea",
     "claude": '[contenteditable="true"]',
-    "deepseek": "textarea",
     "gemini": "textarea",
 }
 

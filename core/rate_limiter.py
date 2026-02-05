@@ -11,7 +11,6 @@ logger = logging.getLogger(__name__)
 DEFAULT_LIMITS = {
     "chatgpt": {"per_hour": 50, "min_interval": 8},
     "claude": {"per_hour": 40, "min_interval": 10},
-    "deepseek": {"per_hour": 60, "min_interval": 5},
     "gemini": {"per_hour": 40, "min_interval": 8},
 }
 

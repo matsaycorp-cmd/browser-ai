@@ -17,7 +17,6 @@ from core.chatgpt_controller import ChatGPTController, ChatGPTTaskRunner
 from core.claude_controller import ClaudeController, ClaudeTaskRunner
 from core.debate_system import AgentRole, DebateOrchestrator
 from core.decision_engine import DecisionEngine
-from core.deepseek_controller import DeepSeekController, DeepSeekTaskRunner
 from core.gemini_controller import GeminiController, GeminiTaskRunner
 from core.parallel_executor import ParallelExecutor
 from core.personnel_searcher import PersonnelEvaluator, PersonnelSearcher
@@ -42,12 +41,11 @@ logger = logging.getLogger(__name__)
 AI_CLASSES = {
     "chatgpt": (ChatGPTController, ChatGPTTaskRunner),
     "claude": (ClaudeController, ClaudeTaskRunner),
-    "deepseek": (DeepSeekController, DeepSeekTaskRunner),
     "gemini": (GeminiController, GeminiTaskRunner),
 }
 
 # 启动顺序
-STARTUP_AI_LIST = ["chatgpt", "claude", "deepseek", "gemini"]
+STARTUP_AI_LIST = ["chatgpt", "claude", "gemini"]
 
 
 class BrowserAIClient:

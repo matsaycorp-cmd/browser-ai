@@ -149,7 +149,7 @@ class DecisionEngine:
         return history["best_result"]
 
     def get_attempt_summary(self, task_id: str) -> str:
-        """生成尝试摘要，如 'ChatGPT(45分)→Claude(62分)→DeepSeek(58分)'。"""
+        """生成尝试摘要，如 'ChatGPT(45分)→Claude(62分)→Gemini(58分)'。"""
         history = self.task_history.get(task_id)
         if not history or not history["attempts"]:
             return "无尝试记录"
@@ -159,8 +159,8 @@ class DecisionEngine:
             name = attempt["ai"].capitalize()
             if attempt["ai"] == "chatgpt":
                 name = "ChatGPT"
-            elif attempt["ai"] == "deepseek":
-                name = "DeepSeek"
+            elif attempt["ai"] == "gemini":
+                name = "Gemini"
             parts.append(f"{name}({attempt['score']}分)")
 
         return "→".join(parts)
