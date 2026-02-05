@@ -23,6 +23,7 @@ from core.personnel_searcher import PersonnelEvaluator, PersonnelSearcher
 from core.quality_checker import QualityChecker
 from core.rate_limiter import RateLimiter
 from core.registry_inquiry import RegistryInquiryRunner
+from core.registry_notifier import RegistryNotifier
 from core.task_persistence import TaskPersistence
 from core.ws_client import WSClient
 
@@ -65,6 +66,7 @@ class BrowserAIClient:
         self.personnel_evaluator: PersonnelEvaluator | None = None
         self.debate_orchestrator: DebateOrchestrator | None = None
         self.registry_inquiry_runner: RegistryInquiryRunner | None = None
+        self.registry_notifier: RegistryNotifier | None = None
 
     # ── 启动 ─────────────────────────────────────────────
 
@@ -122,6 +124,9 @@ class BrowserAIClient:
         if self.controllers:
             self.registry_inquiry_runner = RegistryInquiryRunner(self.controllers)
             print("✅ 官方名录查询器已初始化")
+
+        # 6.5 初始化名录通知器（连接后初始化）
+        self.registry_notifier = RegistryNotifier(self.ws_client)
 
         # 7. 连接 WebSocket
         await self.ws_client.connect()
@@ -950,7 +955,11 @@ Verifier验证：
             return
 
         try:
-            # 1. 通知开始
+            # 1. 发送 Telegram 通知 - 流程开始
+            if self.registry_notifier:
+                await self.registry_notifier.notify_start(country_code, country_name)
+
+            # 1.5 通知 WebSocket 进度
             await self.ws_client.send("registry_inquiry_progress", {
                 "inquiry_id": inquiry_id,
                 "status": "started",
@@ -972,7 +981,20 @@ Verifier验证：
                     email_language="es" if country_code in ("VE", "AR", "BR", "CO", "MX", "CL", "PE", "UY", "PY") else "en",
                 )
 
-            # 2. 发送结果
+            # 2. 发送 Telegram 通知 - 流程完成
+            if self.registry_notifier:
+                # 从结果中提取统计信息
+                final_result = result.get("final_result", {})
+                confidence = result.get("debate_summary", {}).get("judge_success_probability", 0.7)
+                await self.registry_notifier.notify_complete(
+                    success_count=1 if final_result else 0,
+                    pending_count=0,
+                    failed_count=0 if final_result else 1,
+                    slaughterhouses_obtained=0,  # 需要实际数据
+                    baseline_count=0,  # 需要实际数据
+                )
+
+            # 3. 发送 WebSocket 结果
             print(f"  ✅ 官方名录查询完成: {inquiry_id}")
             await self.ws_client.send("registry_inquiry_complete", {
                 "inquiry_id": inquiry_id,
@@ -982,6 +1004,14 @@ Verifier验证：
         except Exception as e:
             logger.error("官方名录查询失败: %s - %s", inquiry_id, e)
             print(f"  ❌ 查询失败: {e}")
+
+            # 发送 Telegram 错误通知
+            if self.registry_notifier:
+                await self.registry_notifier.notify_error(
+                    f"查询失败: {inquiry_id}",
+                    str(e)
+                )
+
             await self.ws_client.send("registry_inquiry_error", {
                 "inquiry_id": inquiry_id,
                 "error": str(e),
