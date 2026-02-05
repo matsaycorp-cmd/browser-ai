@@ -3,7 +3,9 @@
 import asyncio
 import json
 import logging
+import os
 import time
+from urllib.parse import urlparse
 
 import websockets
 
@@ -24,16 +26,46 @@ class WSClient:
     async def connect(self) -> bool:
         """连接 WebSocket 服务器并发送注册消息。"""
         try:
-            self.websocket = await websockets.connect(self.server_url)
-            await self.websocket.send(json.dumps({
-                "type": "register",
-                "client": "browser-ai",
-                "status": "online",
-            }))
-            self.connected = True
-            print(f"✅ 已连接服务器: {self.server_url}")
-            logger.info("已连接 WebSocket 服务器: %s", self.server_url)
-            return True
+            # 检查是否是本地连接，如果是则临时禁用代理
+            parsed = urlparse(self.server_url)
+            host = parsed.hostname or ""
+            is_localhost = host in ("localhost", "127.0.0.1", "::1")
+
+            # 保存原始代理环境变量
+            original_env = {}
+            proxy_vars = ["HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy",
+                          "ALL_PROXY", "all_proxy"]
+
+            if is_localhost:
+                # 临时清除代理设置以避免本地连接被代理拦截
+                for var in proxy_vars:
+                    if var in os.environ:
+                        original_env[var] = os.environ.pop(var)
+
+                # 设置 no_proxy 包含 localhost
+                no_proxy = os.environ.get("NO_PROXY", os.environ.get("no_proxy", ""))
+                if "localhost" not in no_proxy:
+                    os.environ["NO_PROXY"] = f"{no_proxy},localhost,127.0.0.1" if no_proxy else "localhost,127.0.0.1"
+
+                logger.debug("本地连接，已临时禁用代理")
+
+            try:
+                self.websocket = await websockets.connect(self.server_url)
+                await self.websocket.send(json.dumps({
+                    "type": "register",
+                    "client": "browser-ai",
+                    "status": "online",
+                }))
+                self.connected = True
+                print(f"✅ 已连接服务器: {self.server_url}")
+                logger.info("已连接 WebSocket 服务器: %s", self.server_url)
+                return True
+            finally:
+                # 恢复原始代理设置
+                if is_localhost:
+                    for var, value in original_env.items():
+                        os.environ[var] = value
+
         except Exception as e:
             self.connected = False
             print(f"❌ 连接服务器失败: {e}")
