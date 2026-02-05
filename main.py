@@ -18,10 +18,12 @@ from core.claude_controller import ClaudeController, ClaudeTaskRunner
 from core.debate_system import AgentRole, DebateOrchestrator
 from core.decision_engine import DecisionEngine
 from core.deepseek_controller import DeepSeekController, DeepSeekTaskRunner
+from core.gemini_controller import GeminiController, GeminiTaskRunner
 from core.parallel_executor import ParallelExecutor
 from core.personnel_searcher import PersonnelEvaluator, PersonnelSearcher
 from core.quality_checker import QualityChecker
 from core.rate_limiter import RateLimiter
+from core.registry_inquiry import RegistryInquiryRunner
 from core.task_persistence import TaskPersistence
 from core.ws_client import WSClient
 
@@ -41,10 +43,11 @@ AI_CLASSES = {
     "chatgpt": (ChatGPTController, ChatGPTTaskRunner),
     "claude": (ClaudeController, ClaudeTaskRunner),
     "deepseek": (DeepSeekController, DeepSeekTaskRunner),
+    "gemini": (GeminiController, GeminiTaskRunner),
 }
 
 # 启动顺序
-STARTUP_AI_LIST = ["chatgpt", "claude", "deepseek"]
+STARTUP_AI_LIST = ["chatgpt", "claude", "deepseek", "gemini"]
 
 
 class BrowserAIClient:
@@ -63,6 +66,7 @@ class BrowserAIClient:
         self.personnel_searcher: PersonnelSearcher | None = None
         self.personnel_evaluator: PersonnelEvaluator | None = None
         self.debate_orchestrator: DebateOrchestrator | None = None
+        self.registry_inquiry_runner: RegistryInquiryRunner | None = None
 
     # ── 启动 ─────────────────────────────────────────────
 
@@ -116,18 +120,24 @@ class BrowserAIClient:
             self.decision_engine.set_debate_orchestrator(self.debate_orchestrator)
             print("✅ 对抗验证系统已初始化")
 
-        # 6. 连接 WebSocket
+        # 6. 初始化官方名录查询器
+        if self.controllers:
+            self.registry_inquiry_runner = RegistryInquiryRunner(self.controllers)
+            print("✅ 官方名录查询器已初始化")
+
+        # 7. 连接 WebSocket
         await self.ws_client.connect()
 
-        # 7. 注册消息处理器
+        # 8. 注册消息处理器
         self.ws_client.on("new_task", self.handle_new_task)
         self.ws_client.on("retry_task", self.handle_retry_task)
         self.ws_client.on("review_result", self.handle_review_result)
         self.ws_client.on("config_update", self.handle_config_update)
         self.ws_client.on("personnel_search", self.handle_personnel_search)
         self.ws_client.on("debate_task", self.handle_debate_task)
+        self.ws_client.on("registry_inquiry", self.handle_registry_inquiry)
 
-        # 8. 请求服务器配置
+        # 9. 请求服务器配置
         await self.ws_client.request_config()
 
     # ── 任务处理 ──────────────────────────────────────────
@@ -910,6 +920,304 @@ Verifier验证：
 
         # 解析失败，返回原始文本
         return {"raw_text": text[:500], "parse_error": True}
+
+    # ── 官方名录查询处理 ──────────────────────────────────
+
+    async def handle_registry_inquiry(self, message: dict):
+        """处理官方屠宰场名录查询任务。
+
+        使用对抗验证系统提高结果可靠性：
+        - Finder: 搜索官方机构信息和获取途径
+        - Critic: 质疑信息来源可靠性
+        - Verifier: 验证URL和联系方式是否有效
+        - Judge: 综合判断最佳获取方案
+        """
+        data = message.get("data", {})
+        inquiry_id = data.get("inquiry_id", "unknown")
+        country_code = data.get("country_code", "")
+        country_name = data.get("country_name", "")
+        official_agencies = data.get("official_agencies", [])
+        search_results = data.get("search_results", [])
+        use_debate = data.get("use_debate", True)  # 默认使用对抗验证
+
+        print(f"\n🏛️ 收到官方名录查询: {inquiry_id} ({country_name})")
+        logger.info("官方名录查询: %s, 国家: %s (%s)", inquiry_id, country_name, country_code)
+
+        if not self.registry_inquiry_runner:
+            logger.error("官方名录查询器未初始化")
+            await self.ws_client.send("registry_inquiry_error", {
+                "inquiry_id": inquiry_id,
+                "error": "官方名录查询器未初始化",
+            })
+            return
+
+        try:
+            # 1. 通知开始
+            await self.ws_client.send("registry_inquiry_progress", {
+                "inquiry_id": inquiry_id,
+                "status": "started",
+                "message": "开始查询官方名录获取途径",
+            })
+
+            if use_debate and self.debate_orchestrator:
+                # 使用对抗验证系统
+                result = await self._registry_inquiry_with_debate(
+                    inquiry_id, country_code, country_name,
+                    official_agencies, search_results,
+                )
+            else:
+                # 直接使用单AI查询
+                result = await self.registry_inquiry_runner.full_inquiry_workflow(
+                    country_code, country_name,
+                    official_agencies, search_results,
+                    generate_email=True,
+                    email_language="es" if country_code in ("VE", "AR", "BR", "CO", "MX", "CL", "PE", "UY", "PY") else "en",
+                )
+
+            # 2. 发送结果
+            print(f"  ✅ 官方名录查询完成: {inquiry_id}")
+            await self.ws_client.send("registry_inquiry_complete", {
+                "inquiry_id": inquiry_id,
+                "result": result,
+            })
+
+        except Exception as e:
+            logger.error("官方名录查询失败: %s - %s", inquiry_id, e)
+            print(f"  ❌ 查询失败: {e}")
+            await self.ws_client.send("registry_inquiry_error", {
+                "inquiry_id": inquiry_id,
+                "error": str(e),
+            })
+
+    async def _registry_inquiry_with_debate(
+        self,
+        inquiry_id: str,
+        country_code: str,
+        country_name: str,
+        official_agencies: list,
+        search_results: list,
+    ) -> dict:
+        """使用对抗验证系统进行官方名录查询。"""
+        print(f"  ⚔️ 使用对抗验证系统查询 {country_name} 官方名录")
+
+        finder = self.debate_orchestrator.agents.get(AgentRole.FINDER)
+        critic = self.debate_orchestrator.agents.get(AgentRole.CRITIC)
+        verifier = self.debate_orchestrator.agents.get(AgentRole.VERIFIER)
+        judge = self.debate_orchestrator.agents.get(AgentRole.JUDGE)
+
+        rounds = {}
+
+        # === 第1轮：Finder 搜索官方机构信息 ===
+        await self._notify_round_start(inquiry_id, 1, "finder")
+
+        finder_prompt = f"""请搜索{country_name}（{country_code}）官方屠宰场/肉类加工厂名录的获取途径。
+
+已知信息：
+- 可能的官方机构：{', '.join(official_agencies) if official_agencies else '未知'}
+- 之前找到的相关链接：{search_results[:5] if search_results else '无'}
+
+请搜索并提供：
+1. 负责管理屠宰场许可证的官方机构名称
+2. 该机构的官方网站URL
+3. 屠宰场名录是否公开可下载
+4. 如果需要注册，注册页面URL
+5. 如果需要申请，申请流程
+6. 机构联系方式（邮箱、电话）
+7. 是否有其他可获取数据的来源
+
+请返回JSON格式：
+{{
+    "responsible_agency": "机构名称",
+    "agency_website": "官网URL",
+    "access_method": "public_download/registration_required/application_required/unknown",
+    "registration_url": "注册URL或null",
+    "application_process": "申请流程或null",
+    "contact_email": "联系邮箱",
+    "contact_phone": "联系电话",
+    "alternative_sources": ["其他来源"],
+    "found_urls": ["找到的相关URL"],
+    "confidence": 0.0-1.0
+}}"""
+
+        await finder.controller.send_message(finder_prompt)
+        await finder.controller.wait_response()
+        finder_response = await finder.controller.get_last_response()
+        finder_result = {"raw": finder_response, "parsed": self._parse_json(finder_response)}
+        rounds["finder"] = finder_result
+        await self._notify_round_complete(inquiry_id, 1, "finder", finder_result)
+
+        # === 第2轮：Critic 质疑信息可靠性 ===
+        await self._notify_round_start(inquiry_id, 2, "critic")
+
+        critic_prompt = f"""你是政府数据获取专家。请严格审查以下关于{country_name}官方屠宰场名录的信息：
+
+搜索结果：
+{finder_response}
+
+请从以下角度质疑：
+
+1. 机构真实性：
+   - 这是否是真正的政府机构？
+   - 网站URL是否是官方域名（.gov, .gob等）？
+   - 机构名称是否准确？
+
+2. 信息准确性：
+   - 获取方式是否正确？
+   - 注册/申请流程是否真实？
+   - 联系方式是否有效？
+
+3. 可行性评估：
+   - 外国公司能否获取这些数据？
+   - 是否需要当地代理？
+   - 是否有语言障碍？
+
+4. 风险评估：
+   - 信息是否可能过时？
+   - 是否有其他更可靠的来源？
+
+请返回JSON格式：
+{{
+    "agency_concerns": ["对机构的质疑"],
+    "access_concerns": ["对获取方式的质疑"],
+    "url_concerns": ["对URL的质疑"],
+    "contact_concerns": ["对联系方式的质疑"],
+    "feasibility_issues": ["可行性问题"],
+    "questions_to_verify": ["需要验证的问题"],
+    "risk_level": "low/medium/high",
+    "overall_assessment": "整体评估"
+}}"""
+
+        await critic.controller.send_message(critic_prompt)
+        await critic.controller.wait_response()
+        critic_response = await critic.controller.get_last_response()
+        critic_result = {"raw": critic_response, "parsed": self._parse_json(critic_response)}
+        rounds["critic"] = critic_result
+        await self._notify_round_complete(inquiry_id, 2, "critic", critic_result)
+
+        # === 第3轮：Verifier 验证URL和联系方式 ===
+        await self._notify_round_start(inquiry_id, 3, "verifier")
+
+        verifier_prompt = f"""请验证以下关于{country_name}官方屠宰场名录的信息：
+
+Finder搜索结果：
+{finder_response}
+
+Critic质疑：
+{critic_response}
+
+请验证：
+
+1. 验证官方机构：
+   - 搜索确认机构名称是否正确
+   - 确认是否是负责屠宰场监管的部门
+
+2. 验证网站URL：
+   - 确认域名是否为官方域名
+   - 确认网站是否可访问
+   - 确认网站是否有屠宰场相关内容
+
+3. 验证联系方式：
+   - 邮箱域名是否匹配官方网站
+   - 电话区号是否正确
+
+4. 验证获取方式：
+   - 如果声称公开下载，确认是否真的可以下载
+   - 如果需要注册，确认注册页面是否存在
+
+5. 回应Critic的质疑
+
+请返回JSON格式：
+{{
+    "agency_verification": {{"verified": true/false, "evidence": "证据"}},
+    "website_verification": {{"verified": true/false, "status": "状态", "has_registry_content": true/false}},
+    "contact_verification": {{"email_valid": true/false, "phone_valid": true/false, "notes": "备注"}},
+    "access_verification": {{"method_confirmed": true/false, "actual_method": "实际方式", "notes": "备注"}},
+    "critic_responses": ["对质疑的回应"],
+    "verification_confidence": 0.0-1.0
+}}"""
+
+        await verifier.controller.send_message(verifier_prompt)
+        await verifier.controller.wait_response()
+        verifier_response = await verifier.controller.get_last_response()
+        verifier_result = {"raw": verifier_response, "parsed": self._parse_json(verifier_response)}
+        rounds["verifier"] = verifier_result
+        await self._notify_round_complete(inquiry_id, 3, "verifier", verifier_result)
+
+        # === 第4轮：Judge 综合判断最佳方案 ===
+        await self._notify_round_start(inquiry_id, 4, "judge")
+
+        judge_prompt = f"""请作为最终裁判，综合判断获取{country_name}官方屠宰场名录的最佳方案：
+
+Finder搜索：
+{finder_response}
+
+Critic质疑：
+{critic_response}
+
+Verifier验证：
+{verifier_response}
+
+请做出最终判断：
+
+1. 最可靠的官方机构是？
+2. 最佳获取方式是？
+3. 具体步骤是什么？
+4. 预计需要多长时间？
+5. 是否需要准备什么材料？
+6. 有什么替代方案？
+
+请返回JSON格式：
+{{
+    "recommended_agency": "推荐的官方机构",
+    "agency_website": "确认的官网URL",
+    "recommended_method": "推荐的获取方式",
+    "access_steps": ["步骤1", "步骤2", ...],
+    "estimated_time": "预计时间",
+    "required_documents": ["所需材料"],
+    "contact_info": {{
+        "email": "联系邮箱",
+        "phone": "联系电话",
+        "address": "地址"
+    }},
+    "alternative_approaches": ["替代方案"],
+    "success_probability": 0.0-1.0,
+    "risk_factors": ["风险因素"],
+    "special_notes": "特别说明",
+    "final_recommendation": "最终建议（一句话总结）"
+}}"""
+
+        await judge.controller.send_message(judge_prompt)
+        await judge.controller.wait_response()
+        judge_response = await judge.controller.get_last_response()
+        judge_result = {"raw": judge_response, "parsed": self._parse_json(judge_response)}
+        rounds["judge"] = judge_result
+        await self._notify_round_complete(inquiry_id, 4, "judge", judge_result)
+
+        # === 生成询问邮件（如果有联系方式）===
+        inquiry_email = None
+        judge_parsed = judge_result.get("parsed", {})
+        contact_email = judge_parsed.get("contact_info", {}).get("email")
+
+        if contact_email and self.registry_inquiry_runner:
+            agency = judge_parsed.get("recommended_agency", f"{country_name}官方机构")
+            lang = "es" if country_code in ("VE", "AR", "CO", "MX", "CL", "PE", "UY", "PY") else "pt" if country_code == "BR" else "en"
+            inquiry_email = await self.registry_inquiry_runner.generate_inquiry_email(
+                agency, country_name, lang
+            )
+
+        return {
+            "country_code": country_code,
+            "country_name": country_name,
+            "debate_rounds": rounds,
+            "final_result": judge_result.get("parsed", {}),
+            "inquiry_email": inquiry_email,
+            "debate_summary": {
+                "finder_confidence": finder_result.get("parsed", {}).get("confidence"),
+                "critic_risk_level": critic_result.get("parsed", {}).get("risk_level"),
+                "verifier_confidence": verifier_result.get("parsed", {}).get("verification_confidence"),
+                "judge_success_probability": judge_result.get("parsed", {}).get("success_probability"),
+            }
+        }
 
     # ── 服务器指令处理 ───────────────────────────────────
 
