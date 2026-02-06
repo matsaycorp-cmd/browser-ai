@@ -139,6 +139,7 @@ class BrowserAIClient:
         self.ws_client.on("personnel_search", self.handle_personnel_search)
         self.ws_client.on("debate_task", self.handle_debate_task)
         self.ws_client.on("registry_inquiry", self.handle_registry_inquiry)
+        self.ws_client.on("browser_task", self.handle_browser_task)
 
         # 9. 请求服务器配置
         await self.ws_client.request_config()
@@ -1016,6 +1017,259 @@ Verifier验证：
                 "inquiry_id": inquiry_id,
                 "error": str(e),
             })
+
+    # ── Browser 任务处理 ──────────────────────────────────────
+
+    async def handle_browser_task(self, message: dict):
+        """处理来自 Telegram 的浏览器任务。
+
+        支持的任务类型：
+        - browse: 访问网页并提取内容
+        - search: 搜索并返回结果
+        - download: 下载文件
+        - ai_query: 直接询问 AI
+        """
+        data = message.get("data", {})
+        task_id = data.get("task_id", "unknown")
+        task_type = data.get("task_type", "")
+        params = data.get("params", {})
+
+        print(f"\n🌐 收到 Browser 任务: {task_id} ({task_type})")
+        logger.info("Browser任务: %s (%s)", task_id, task_type)
+
+        try:
+            if task_type == "browse":
+                result = await self._handle_browse_task(task_id, params)
+            elif task_type == "search":
+                result = await self._handle_search_task(task_id, params)
+            elif task_type == "download":
+                result = await self._handle_download_task(task_id, params)
+            elif task_type == "ai_query":
+                result = await self._handle_ai_query_task(task_id, params)
+            else:
+                raise ValueError(f"未知的 Browser 任务类型: {task_type}")
+
+            # 发送成功结果
+            result["task_id"] = task_id
+            result["task_type"] = task_type
+            result["status"] = "success"
+            await self.ws_client.send(f"{task_type}_result", result)
+            print(f"  ✅ Browser 任务完成: {task_id}")
+
+        except Exception as e:
+            logger.error("Browser任务失败: %s - %s", task_id, e)
+            print(f"  ❌ Browser 任务失败: {e}")
+            await self.ws_client.send("browser_task_error", {
+                "task_id": task_id,
+                "task_type": task_type,
+                "error": str(e),
+            })
+
+    async def _handle_browse_task(self, task_id: str, params: dict) -> dict:
+        """处理网页浏览任务。"""
+        url = params.get("url", "")
+        extract_content = params.get("extract_content", True)
+        take_screenshot = params.get("take_screenshot", False)
+        wait_selector = params.get("wait_selector")
+
+        if not url:
+            raise ValueError("URL 不能为空")
+
+        print(f"  📄 访问网页: {url}")
+
+        # 使用第一个可用的 AI 控制器的页面
+        if not self.controllers:
+            raise RuntimeError("没有可用的 AI 控制器")
+
+        # 获取一个浏览器页面
+        ai_name = next(iter(self.controllers.keys()))
+        controller = self.controllers[ai_name]
+        page = controller.page
+
+        # 创建新标签页访问 URL
+        new_page = await self.browser_manager.browser.new_page()
+        try:
+            await new_page.goto(url, wait_until="domcontentloaded", timeout=30000)
+
+            if wait_selector:
+                await new_page.wait_for_selector(wait_selector, timeout=10000)
+
+            # 获取页面标题
+            title = await new_page.title()
+
+            # 提取内容
+            content = ""
+            if extract_content:
+                content = await new_page.evaluate("""
+                    () => {
+                        const article = document.querySelector('article') ||
+                                        document.querySelector('main') ||
+                                        document.body;
+                        return article ? article.innerText.substring(0, 5000) : '';
+                    }
+                """)
+
+            # 截图
+            screenshot_path = None
+            if take_screenshot:
+                import os
+                os.makedirs("./data/screenshots", exist_ok=True)
+                screenshot_path = f"./data/screenshots/{task_id}.png"
+                await new_page.screenshot(path=screenshot_path)
+
+            return {
+                "url": url,
+                "title": title,
+                "content": content,
+                "screenshot_path": screenshot_path,
+            }
+
+        finally:
+            await new_page.close()
+
+    async def _handle_search_task(self, task_id: str, params: dict) -> dict:
+        """处理搜索任务。"""
+        query = params.get("query", "")
+        search_engine = params.get("search_engine", "google")
+        max_results = params.get("max_results", 10)
+        use_ai = params.get("use_ai")
+
+        if not query:
+            raise ValueError("搜索关键词不能为空")
+
+        print(f"  🔍 搜索: {query}")
+
+        # 使用 AI 进行搜索
+        if not self.controllers:
+            raise RuntimeError("没有可用的 AI 控制器")
+
+        ai_name = use_ai or "chatgpt"
+        if ai_name not in self.controllers:
+            ai_name = next(iter(self.controllers.keys()))
+
+        controller = self.controllers[ai_name]
+
+        # 构造搜索提示
+        search_prompt = f"""请帮我搜索以下内容并返回结果：
+
+搜索关键词：{query}
+
+请返回最多 {max_results} 个相关结果，每个结果包含：
+1. 标题
+2. URL（如果知道）
+3. 简短描述
+
+请以结构化的方式呈现结果。"""
+
+        response = await controller.send_message(search_prompt)
+
+        # 如果需要 AI 总结
+        ai_summary = None
+        if use_ai:
+            summary_prompt = f"请简要总结以下搜索结果的要点（100字以内）：\n\n{response}"
+            ai_summary = await controller.send_message(summary_prompt)
+
+        return {
+            "query": query,
+            "results": [{"title": "搜索结果", "snippet": response[:500]}],
+            "ai_summary": ai_summary,
+            "raw": response,
+        }
+
+    async def _handle_download_task(self, task_id: str, params: dict) -> dict:
+        """处理文件下载任务。"""
+        import aiohttp
+        import os
+
+        url = params.get("url", "")
+        save_dir = params.get("save_dir", "./data/registry_downloads")
+        filename = params.get("filename")
+        use_browser = params.get("use_browser", False)
+
+        if not url:
+            raise ValueError("下载 URL 不能为空")
+
+        print(f"  📥 下载文件: {url}")
+
+        # 确保目录存在
+        os.makedirs(save_dir, exist_ok=True)
+
+        # 从 URL 提取文件名
+        if not filename:
+            from urllib.parse import urlparse, unquote
+            parsed = urlparse(url)
+            filename = unquote(parsed.path.split("/")[-1]) or f"download_{task_id}"
+
+        file_path = os.path.join(save_dir, filename)
+
+        if use_browser:
+            # 使用浏览器下载（用于需要登录的页面）
+            if not self.controllers:
+                raise RuntimeError("没有可用的浏览器")
+
+            new_page = await self.browser_manager.browser.new_page()
+            try:
+                # 设置下载路径
+                async with new_page.expect_download() as download_info:
+                    await new_page.goto(url)
+
+                download = await download_info.value
+                await download.save_as(file_path)
+                file_size = os.path.getsize(file_path)
+
+            finally:
+                await new_page.close()
+        else:
+            # 普通 HTTP 下载
+            async with aiohttp.ClientSession() as session:
+                async with session.get(url) as response:
+                    if response.status != 200:
+                        raise RuntimeError(f"下载失败: HTTP {response.status}")
+
+                    with open(file_path, "wb") as f:
+                        while True:
+                            chunk = await response.content.read(8192)
+                            if not chunk:
+                                break
+                            f.write(chunk)
+
+                    file_size = os.path.getsize(file_path)
+
+        return {
+            "url": url,
+            "file_path": file_path,
+            "file_size": file_size,
+        }
+
+    async def _handle_ai_query_task(self, task_id: str, params: dict) -> dict:
+        """处理 AI 查询任务。"""
+        prompt = params.get("prompt", "")
+        use_ai = params.get("use_ai", "chatgpt")
+        new_chat = params.get("new_chat", True)
+
+        if not prompt:
+            raise ValueError("提示词不能为空")
+
+        print(f"  🤖 询问 {use_ai}: {prompt[:50]}...")
+
+        if not self.controllers:
+            raise RuntimeError("没有可用的 AI 控制器")
+
+        if use_ai not in self.controllers:
+            use_ai = next(iter(self.controllers.keys()))
+
+        controller = self.controllers[use_ai]
+
+        # 如果需要新建对话
+        if new_chat and hasattr(controller, "new_chat"):
+            await controller.new_chat()
+
+        response = await controller.send_message(prompt)
+
+        return {
+            "ai": use_ai,
+            "response": response,
+        }
 
     async def _registry_inquiry_with_debate(
         self,

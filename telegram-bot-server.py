@@ -74,12 +74,20 @@ class BrowserAIServer:
         self.application.add_handler(CommandHandler("search", self.cmd_search))
         self.application.add_handler(CommandHandler("slaughter", self.cmd_slaughter))
         self.application.add_handler(CommandHandler("registry", self.cmd_registry))
+        # Browser AI 命令
+        self.application.add_handler(CommandHandler("ai_browse", self.cmd_ai_browse))
+        self.application.add_handler(CommandHandler("ai_search", self.cmd_ai_search))
+        self.application.add_handler(CommandHandler("ai_download", self.cmd_ai_download))
+        self.application.add_handler(CommandHandler("ai_ask", self.cmd_ai_ask))
         # 回调按钮处理
         self.application.add_handler(
             CallbackQueryHandler(self.handle_callback, pattern="^registry_")
         )
         self.application.add_handler(
             CallbackQueryHandler(self.handle_callback, pattern="^approve_|^reject_")
+        )
+        self.application.add_handler(
+            CallbackQueryHandler(self.handle_callback, pattern="^browse_|^download_")
         )
 
     # ══════════════════════════════════════════════════════════
@@ -90,10 +98,16 @@ class BrowserAIServer:
         """处理 /start 命令。"""
         await update.message.reply_text(
             "🤖 <b>Browser-AI 控制面板</b>\n\n"
+            "<b>📋 业务命令</b>\n"
             "/status - 查看状态\n"
             "/search <公司> <国家> - 搜索联系方式\n"
             "/slaughter <国家> - 搜索屠宰场\n"
-            "/registry <国家代码> <国家名> - 查询官方名录",
+            "/registry <国家代码> <国家名> - 查询官方名录\n\n"
+            "<b>🌐 浏览器命令</b>\n"
+            "/ai_browse <URL> - 访问网页并提取内容\n"
+            "/ai_search <关键词> - AI搜索并总结\n"
+            "/ai_download <URL> - 下载文件\n"
+            "/ai_ask <问题> - 直接询问AI",
             parse_mode="HTML",
         )
 
@@ -198,6 +212,263 @@ class BrowserAIServer:
         else:
             await update.message.reply_text("❌ 发送失败，Browser-AI 未连接")
 
+    # ══════════════════════════════════════════════════════════
+    # Browser AI 命令
+    # ══════════════════════════════════════════════════════════
+
+    async def cmd_ai_browse(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """处理 /ai_browse 命令 - 让 Browser AI 访问网页。"""
+        args = context.args
+        if not args:
+            await update.message.reply_text(
+                "用法: /ai_browse <URL> [选项]\n\n"
+                "选项:\n"
+                "  --screenshot  截取页面截图\n"
+                "  --wait <选择器>  等待元素加载\n\n"
+                "示例:\n"
+                "/ai_browse https://example.com\n"
+                "/ai_browse https://example.com --screenshot"
+            )
+            return
+
+        url = args[0]
+        take_screenshot = "--screenshot" in args
+        wait_selector = None
+
+        # 解析 --wait 参数
+        if "--wait" in args:
+            try:
+                wait_idx = args.index("--wait")
+                if wait_idx + 1 < len(args):
+                    wait_selector = args[wait_idx + 1]
+            except (ValueError, IndexError):
+                pass
+
+        task_id = f"browse_{int(datetime.now().timestamp())}"
+
+        success = await self._send_to_browser_ai("browser_task", {
+            "task_id": task_id,
+            "task_type": "browse",
+            "params": {
+                "url": url,
+                "extract_content": True,
+                "take_screenshot": take_screenshot,
+                "wait_selector": wait_selector,
+            },
+        })
+
+        if success:
+            await update.message.reply_text(
+                f"🌐 <b>正在访问网页</b>\n"
+                f"━━━━━━━━━━━━━━━━━━\n"
+                f"URL: {url}\n"
+                f"截图: {'是' if take_screenshot else '否'}\n"
+                f"任务ID: <code>{task_id}</code>",
+                parse_mode="HTML",
+            )
+            self.pending_tasks[task_id] = {
+                "type": "browse",
+                "chat_id": update.effective_chat.id,
+                "url": url,
+                "created_at": datetime.now().isoformat(),
+            }
+        else:
+            await update.message.reply_text("❌ 发送失败，Browser-AI 未连接")
+
+    async def cmd_ai_search(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """处理 /ai_search 命令 - 让 Browser AI 搜索内容。"""
+        args = context.args
+        if not args:
+            await update.message.reply_text(
+                "用法: /ai_search <关键词> [选项]\n\n"
+                "选项:\n"
+                "  --ai <名称>  使用指定AI总结 (chatgpt/claude/gemini)\n"
+                "  --max <数量>  最大结果数 (默认10)\n\n"
+                "示例:\n"
+                "/ai_search 阿根廷屠宰场名录\n"
+                "/ai_search 牛黄价格 --ai chatgpt"
+            )
+            return
+
+        # 解析参数
+        use_ai = None
+        max_results = 10
+        query_parts = []
+
+        i = 0
+        while i < len(args):
+            if args[i] == "--ai" and i + 1 < len(args):
+                use_ai = args[i + 1]
+                i += 2
+            elif args[i] == "--max" and i + 1 < len(args):
+                try:
+                    max_results = int(args[i + 1])
+                except ValueError:
+                    pass
+                i += 2
+            else:
+                query_parts.append(args[i])
+                i += 1
+
+        query = " ".join(query_parts)
+        if not query:
+            await update.message.reply_text("请提供搜索关键词")
+            return
+
+        task_id = f"search_{int(datetime.now().timestamp())}"
+
+        success = await self._send_to_browser_ai("browser_task", {
+            "task_id": task_id,
+            "task_type": "search",
+            "params": {
+                "query": query,
+                "search_engine": "google",
+                "max_results": max_results,
+                "use_ai": use_ai,
+            },
+        })
+
+        if success:
+            ai_text = f"AI总结: {use_ai}" if use_ai else "无AI总结"
+            await update.message.reply_text(
+                f"🔍 <b>正在搜索</b>\n"
+                f"━━━━━━━━━━━━━━━━━━\n"
+                f"关键词: {query}\n"
+                f"最大结果: {max_results}\n"
+                f"{ai_text}\n"
+                f"任务ID: <code>{task_id}</code>",
+                parse_mode="HTML",
+            )
+            self.pending_tasks[task_id] = {
+                "type": "search",
+                "chat_id": update.effective_chat.id,
+                "query": query,
+                "created_at": datetime.now().isoformat(),
+            }
+        else:
+            await update.message.reply_text("❌ 发送失败，Browser-AI 未连接")
+
+    async def cmd_ai_download(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """处理 /ai_download 命令 - 让 Browser AI 下载文件。"""
+        args = context.args
+        if not args:
+            await update.message.reply_text(
+                "用法: /ai_download <URL> [选项]\n\n"
+                "选项:\n"
+                "  --browser  使用浏览器下载（需要登录的页面）\n"
+                "  --name <文件名>  指定保存文件名\n\n"
+                "示例:\n"
+                "/ai_download https://example.com/file.pdf\n"
+                "/ai_download https://example.com/data.xlsx --browser"
+            )
+            return
+
+        url = args[0]
+        use_browser = "--browser" in args
+        filename = None
+
+        # 解析 --name 参数
+        if "--name" in args:
+            try:
+                name_idx = args.index("--name")
+                if name_idx + 1 < len(args):
+                    filename = args[name_idx + 1]
+            except (ValueError, IndexError):
+                pass
+
+        task_id = f"download_{int(datetime.now().timestamp())}"
+
+        success = await self._send_to_browser_ai("browser_task", {
+            "task_id": task_id,
+            "task_type": "download",
+            "params": {
+                "url": url,
+                "save_dir": "./data/registry_downloads",
+                "filename": filename,
+                "use_browser": use_browser,
+            },
+        })
+
+        if success:
+            await update.message.reply_text(
+                f"📥 <b>正在下载文件</b>\n"
+                f"━━━━━━━━━━━━━━━━━━\n"
+                f"URL: {url}\n"
+                f"浏览器模式: {'是' if use_browser else '否'}\n"
+                f"任务ID: <code>{task_id}</code>",
+                parse_mode="HTML",
+            )
+            self.pending_tasks[task_id] = {
+                "type": "download",
+                "chat_id": update.effective_chat.id,
+                "url": url,
+                "created_at": datetime.now().isoformat(),
+            }
+        else:
+            await update.message.reply_text("❌ 发送失败，Browser-AI 未连接")
+
+    async def cmd_ai_ask(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """处理 /ai_ask 命令 - 直接向 AI 提问。"""
+        args = context.args
+        if not args:
+            await update.message.reply_text(
+                "用法: /ai_ask <问题> [选项]\n\n"
+                "选项:\n"
+                "  --ai <名称>  使用指定AI (chatgpt/claude/gemini)\n\n"
+                "示例:\n"
+                "/ai_ask 南美洲主要的牛肉出口国有哪些\n"
+                "/ai_ask 牛黄的市场价格是多少 --ai claude"
+            )
+            return
+
+        # 解析参数
+        use_ai = "chatgpt"  # 默认使用 ChatGPT
+        prompt_parts = []
+
+        i = 0
+        while i < len(args):
+            if args[i] == "--ai" and i + 1 < len(args):
+                use_ai = args[i + 1]
+                i += 2
+            else:
+                prompt_parts.append(args[i])
+                i += 1
+
+        prompt = " ".join(prompt_parts)
+        if not prompt:
+            await update.message.reply_text("请提供问题内容")
+            return
+
+        task_id = f"ask_{int(datetime.now().timestamp())}"
+
+        success = await self._send_to_browser_ai("browser_task", {
+            "task_id": task_id,
+            "task_type": "ai_query",
+            "params": {
+                "prompt": prompt,
+                "use_ai": use_ai,
+                "new_chat": True,
+            },
+        })
+
+        if success:
+            await update.message.reply_text(
+                f"🤖 <b>正在询问 {use_ai.upper()}</b>\n"
+                f"━━━━━━━━━━━━━━━━━━\n"
+                f"问题: {prompt[:100]}{'...' if len(prompt) > 100 else ''}\n"
+                f"任务ID: <code>{task_id}</code>",
+                parse_mode="HTML",
+            )
+            self.pending_tasks[task_id] = {
+                "type": "ai_query",
+                "chat_id": update.effective_chat.id,
+                "prompt": prompt,
+                "ai": use_ai,
+                "created_at": datetime.now().isoformat(),
+            }
+        else:
+            await update.message.reply_text("❌ 发送失败，Browser-AI 未连接")
+
     async def handle_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """处理回调按钮。"""
         query = update.callback_query
@@ -296,6 +567,16 @@ class BrowserAIServer:
 
                     elif msg_type == "registry_inquiry_error":
                         await self._handle_registry_error(msg_data)
+
+                    # Browser 任务结果
+                    elif msg_type in ("browse_result", "search_result", "download_result", "ai_query_result"):
+                        await self._handle_browser_task_result(msg_data)
+
+                    elif msg_type == "browser_task_error":
+                        await self._handle_browser_task_error(msg_data)
+
+                    elif msg_type == "browser_task_progress":
+                        await self._handle_browser_task_progress(msg_data)
 
                 except json.JSONDecodeError:
                     logger.warning(f"无效JSON: {message[:100]}")
@@ -536,6 +817,189 @@ class BrowserAIServer:
         # 清理待处理任务
         if inquiry_id in self.pending_tasks:
             del self.pending_tasks[inquiry_id]
+
+    # ══════════════════════════════════════════════════════════
+    # Browser 任务结果处理
+    # ══════════════════════════════════════════════════════════
+
+    async def _handle_browser_task_result(self, data: dict):
+        """处理 Browser 任务结果。"""
+        task_id = data.get("task_id", "")
+        task_type = data.get("task_type", "")
+        status = data.get("status", "")
+
+        if not self.application:
+            return
+
+        # 根据任务类型格式化结果
+        if task_type == "browse":
+            message = self._format_browse_result(data)
+        elif task_type == "search":
+            message = self._format_search_result(data)
+        elif task_type == "download":
+            message = self._format_download_result(data)
+        elif task_type == "ai_query":
+            message = self._format_ai_query_result(data)
+        else:
+            message = f"📋 任务完成: {task_id}\n状态: {status}"
+
+        for chat_id in TELEGRAM_ADMIN_IDS:
+            try:
+                await self.application.bot.send_message(
+                    chat_id=chat_id,
+                    text=message,
+                    parse_mode="HTML",
+                    disable_web_page_preview=True,
+                )
+            except Exception as e:
+                logger.error(f"发送Browser任务结果失败: {e}")
+
+        # 清理待处理任务
+        if task_id in self.pending_tasks:
+            del self.pending_tasks[task_id]
+
+    def _format_browse_result(self, data: dict) -> str:
+        """格式化浏览结果。"""
+        url = data.get("url", "")
+        title = data.get("title", "无标题")
+        content = data.get("content", "")[:500]
+        status = data.get("status", "")
+
+        if status == "success":
+            message = (
+                f"🌐 <b>网页访问完成</b>\n"
+                f"━━━━━━━━━━━━━━━━━━\n"
+                f"标题: {title}\n"
+                f"URL: {url}\n"
+            )
+            if content:
+                message += f"\n📄 内容预览:\n<code>{content}</code>"
+
+            if data.get("screenshot_path"):
+                message += f"\n\n📷 截图已保存"
+        else:
+            error = data.get("error", "未知错误")
+            message = f"❌ <b>网页访问失败</b>\nURL: {url}\n错误: {error}"
+
+        return message
+
+    def _format_search_result(self, data: dict) -> str:
+        """格式化搜索结果。"""
+        query = data.get("query", "")
+        results = data.get("results", [])
+        ai_summary = data.get("ai_summary", "")
+        status = data.get("status", "")
+
+        if status == "success":
+            message = (
+                f"🔍 <b>搜索完成</b>\n"
+                f"━━━━━━━━━━━━━━━━━━\n"
+                f"关键词: {query}\n"
+                f"结果数: {len(results)}\n"
+            )
+
+            # 显示前5个结果
+            if results:
+                message += "\n📋 搜索结果:\n"
+                for i, r in enumerate(results[:5], 1):
+                    title = r.get("title", "")[:50]
+                    url = r.get("url", "")
+                    message += f"{i}. <a href=\"{url}\">{title}</a>\n"
+
+            if ai_summary:
+                message += f"\n🤖 AI总结:\n{ai_summary[:300]}"
+        else:
+            error = data.get("error", "未知错误")
+            message = f"❌ <b>搜索失败</b>\n关键词: {query}\n错误: {error}"
+
+        return message
+
+    def _format_download_result(self, data: dict) -> str:
+        """格式化下载结果。"""
+        url = data.get("url", "")
+        file_path = data.get("file_path", "")
+        file_size = data.get("file_size", 0)
+        status = data.get("status", "")
+
+        if status == "success":
+            # 格式化文件大小
+            if file_size > 1024 * 1024:
+                size_str = f"{file_size / 1024 / 1024:.1f} MB"
+            elif file_size > 1024:
+                size_str = f"{file_size / 1024:.1f} KB"
+            else:
+                size_str = f"{file_size} B"
+
+            message = (
+                f"📥 <b>下载完成</b>\n"
+                f"━━━━━━━━━━━━━━━━━━\n"
+                f"文件: {file_path.split('/')[-1] if file_path else '未知'}\n"
+                f"大小: {size_str}\n"
+                f"保存路径: <code>{file_path}</code>"
+            )
+        else:
+            error = data.get("error", "未知错误")
+            message = f"❌ <b>下载失败</b>\nURL: {url}\n错误: {error}"
+
+        return message
+
+    def _format_ai_query_result(self, data: dict) -> str:
+        """格式化 AI 查询结果。"""
+        ai = data.get("ai", "")
+        response = data.get("response", "")[:1000]
+        status = data.get("status", "")
+
+        if status == "success":
+            message = (
+                f"🤖 <b>{ai.upper()} 回复</b>\n"
+                f"━━━━━━━━━━━━━━━━━━\n"
+                f"{response}"
+            )
+        else:
+            error = data.get("error", "未知错误")
+            message = f"❌ <b>AI查询失败</b>\nAI: {ai}\n错误: {error}"
+
+        return message
+
+    async def _handle_browser_task_error(self, data: dict):
+        """处理 Browser 任务错误。"""
+        task_id = data.get("task_id", "")
+        error = data.get("error", "未知错误")
+        task_type = data.get("task_type", "")
+
+        if not self.application:
+            return
+
+        message = (
+            f"❌ <b>Browser任务失败</b>\n"
+            f"━━━━━━━━━━━━━━━━━━\n"
+            f"任务: {task_id}\n"
+            f"类型: {task_type}\n"
+            f"错误: {error}"
+        )
+
+        for chat_id in TELEGRAM_ADMIN_IDS:
+            try:
+                await self.application.bot.send_message(
+                    chat_id=chat_id,
+                    text=message,
+                    parse_mode="HTML",
+                )
+            except Exception as e:
+                logger.error(f"发送Browser任务错误失败: {e}")
+
+        # 清理待处理任务
+        if task_id in self.pending_tasks:
+            del self.pending_tasks[task_id]
+
+    async def _handle_browser_task_progress(self, data: dict):
+        """处理 Browser 任务进度更新。"""
+        task_id = data.get("task_id", "")
+        progress = data.get("progress", 0)
+        message_text = data.get("message", "")
+
+        # 进度更新可以选择性发送或只记录日志
+        logger.info(f"任务 {task_id} 进度: {progress}% - {message_text}")
 
 
 async def main():
