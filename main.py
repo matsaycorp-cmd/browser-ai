@@ -140,6 +140,7 @@ class BrowserAIClient:
         self.ws_client.on("debate_task", self.handle_debate_task)
         self.ws_client.on("registry_inquiry", self.handle_registry_inquiry)
         self.ws_client.on("browser_task", self.handle_browser_task)
+        self.ws_client.on("parallel_search", self.handle_parallel_search)
 
         # 9. 请求服务器配置
         await self.ws_client.request_config()
@@ -1064,6 +1065,186 @@ Verifier验证：
                 "task_type": task_type,
                 "error": str(e),
             })
+
+    # ── 并行搜索处理 ──────────────────────────────────────
+
+    async def handle_parallel_search(self, message: dict):
+        """处理并行搜索任务。
+
+        支持同时搜索多个关键词，使用不同的搜索引擎。
+
+        消息格式：
+        {
+            "type": "parallel_search",
+            "data": {
+                "task_id": "uuid",
+                "queries": [
+                    {"id": "q1", "query": "搜索词1", "engine": "google"},
+                    {"id": "q2", "query": "搜索词2", "engine": "bing"},
+                ],
+                "max_concurrent": 3,
+                "timeout_per_query": 30
+            }
+        }
+        """
+        data = message.get("data", {})
+        task_id = data.get("task_id", "unknown")
+        queries = data.get("queries", [])
+        max_concurrent = data.get("max_concurrent", 3)
+        timeout_per_query = data.get("timeout_per_query", 30)
+
+        print(f"\n🔍 收到并行搜索任务: {task_id} ({len(queries)} 个查询)")
+        logger.info("并行搜索任务: %s, 查询数: %d", task_id, len(queries))
+
+        if not queries:
+            await self.ws_client.send("parallel_search_error", {
+                "task_id": task_id,
+                "error": "搜索列表为空",
+            })
+            return
+
+        if not self.controllers:
+            await self.ws_client.send("parallel_search_error", {
+                "task_id": task_id,
+                "error": "没有可用的 AI 控制器",
+            })
+            return
+
+        try:
+            # 1. 通知开始
+            await self.ws_client.send("parallel_search_progress", {
+                "task_id": task_id,
+                "status": "started",
+                "total": len(queries),
+                "completed": 0,
+                "message": f"开始并行搜索 {len(queries)} 个查询",
+            })
+
+            # 2. 使用信号量控制并发
+            semaphore = asyncio.Semaphore(max_concurrent)
+            results = []
+            completed_count = 0
+
+            async def search_single(query_item: dict) -> dict:
+                """执行单个搜索任务。"""
+                nonlocal completed_count
+                query_id = query_item.get("id", "unknown")
+                query = query_item.get("query", "")
+                engine = query_item.get("engine", "google")
+
+                async with semaphore:
+                    try:
+                        result = await asyncio.wait_for(
+                            self._execute_search(query, engine),
+                            timeout=timeout_per_query
+                        )
+                        completed_count += 1
+
+                        # 发送进度更新
+                        await self.ws_client.send("parallel_search_progress", {
+                            "task_id": task_id,
+                            "status": "running",
+                            "total": len(queries),
+                            "completed": completed_count,
+                            "current_query": query,
+                            "message": f"完成 {completed_count}/{len(queries)}",
+                        })
+
+                        return {
+                            "id": query_id,
+                            "query": query,
+                            "engine": engine,
+                            "status": "success",
+                            "results": result.get("results", []),
+                            "raw": result.get("raw", ""),
+                        }
+                    except asyncio.TimeoutError:
+                        completed_count += 1
+                        return {
+                            "id": query_id,
+                            "query": query,
+                            "engine": engine,
+                            "status": "timeout",
+                            "error": f"搜索超时 ({timeout_per_query}s)",
+                        }
+                    except Exception as e:
+                        completed_count += 1
+                        return {
+                            "id": query_id,
+                            "query": query,
+                            "engine": engine,
+                            "status": "error",
+                            "error": str(e),
+                        }
+
+            # 3. 并行执行所有搜索
+            tasks = [search_single(q) for q in queries]
+            results = await asyncio.gather(*tasks, return_exceptions=False)
+
+            # 4. 统计结果
+            success_count = sum(1 for r in results if r.get("status") == "success")
+            error_count = sum(1 for r in results if r.get("status") in ("error", "timeout"))
+
+            # 5. 发送最终结果
+            await self.ws_client.send("parallel_search_complete", {
+                "task_id": task_id,
+                "status": "completed",
+                "total": len(queries),
+                "success_count": success_count,
+                "error_count": error_count,
+                "results": results,
+            })
+
+            print(f"  ✅ 并行搜索完成: {task_id} (成功: {success_count}, 失败: {error_count})")
+
+        except Exception as e:
+            logger.error("并行搜索失败: %s - %s", task_id, e)
+            print(f"  ❌ 并行搜索失败: {e}")
+            await self.ws_client.send("parallel_search_error", {
+                "task_id": task_id,
+                "error": str(e),
+            })
+
+    async def _execute_search(self, query: str, engine: str = "google") -> dict:
+        """执行单个搜索查询。
+
+        Args:
+            query: 搜索关键词
+            engine: 搜索引擎 (google/bing/duckduckgo)
+
+        Returns:
+            搜索结果
+        """
+        # 选择 AI 控制器
+        ai_name = self.rate_limiter.get_available_ai(list(self.controllers.keys()))
+        if not ai_name:
+            ai_name = next(iter(self.controllers.keys()))
+
+        controller = self.controllers[ai_name]
+
+        # 根据搜索引擎构造提示
+        engine_prompts = {
+            "google": f"请使用 Google 搜索以下内容并返回前10个结果：\n\n{query}\n\n请返回每个结果的标题、URL和简短描述。",
+            "bing": f"请使用 Bing 搜索以下内容并返回前10个结果：\n\n{query}\n\n请返回每个结果的标题、URL和简短描述。",
+            "duckduckgo": f"请使用 DuckDuckGo 搜索以下内容并返回前10个结果：\n\n{query}\n\n请返回每个结果的标题、URL和简短描述。",
+        }
+
+        prompt = engine_prompts.get(engine, engine_prompts["google"])
+
+        # 发送消息并获取响应
+        await controller.send_message(prompt)
+        await controller.wait_response()
+        response = await controller.get_last_response()
+
+        # 记录请求
+        self.rate_limiter.record_request(ai_name)
+
+        # 解析结果
+        return {
+            "results": [{"title": "搜索结果", "snippet": response[:500] if response else ""}],
+            "raw": response,
+            "ai_used": ai_name,
+        }
 
     async def _handle_browse_task(self, task_id: str, params: dict) -> dict:
         """处理网页浏览任务。"""

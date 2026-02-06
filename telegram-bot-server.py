@@ -79,6 +79,7 @@ class BrowserAIServer:
         self.application.add_handler(CommandHandler("ai_search", self.cmd_ai_search))
         self.application.add_handler(CommandHandler("ai_download", self.cmd_ai_download))
         self.application.add_handler(CommandHandler("ai_ask", self.cmd_ai_ask))
+        self.application.add_handler(CommandHandler("ai_parallel", self.cmd_ai_parallel_search))
         # 回调按钮处理
         self.application.add_handler(
             CallbackQueryHandler(self.handle_callback, pattern="^registry_")
@@ -107,7 +108,8 @@ class BrowserAIServer:
             "/ai_browse <URL> - 访问网页并提取内容\n"
             "/ai_search <关键词> - AI搜索并总结\n"
             "/ai_download <URL> - 下载文件\n"
-            "/ai_ask <问题> - 直接询问AI",
+            "/ai_ask <问题> - 直接询问AI\n"
+            "/ai_parallel <查询1>|<查询2>... - 并行搜索多个关键词",
             parse_mode="HTML",
         )
 
@@ -469,6 +471,106 @@ class BrowserAIServer:
         else:
             await update.message.reply_text("❌ 发送失败，Browser-AI 未连接")
 
+    async def cmd_ai_parallel_search(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """处理 /ai_parallel 命令 - 并行搜索多个关键词。"""
+        args = context.args
+        if not args:
+            await update.message.reply_text(
+                "用法: /ai_parallel <查询1> | <查询2> | ... [选项]\n\n"
+                "使用 | 分隔多个搜索关键词\n\n"
+                "选项:\n"
+                "  --max <数量>  最大并发数 (默认3)\n"
+                "  --timeout <秒>  单个查询超时 (默认30)\n"
+                "  --engine <引擎>  搜索引擎 (google/bing/duckduckgo)\n\n"
+                "示例:\n"
+                "/ai_parallel 阿根廷屠宰场 | 巴西屠宰场 | 乌拉圭屠宰场\n"
+                "/ai_parallel 公司A联系方式 | 公司B联系方式 --max 5"
+            )
+            return
+
+        # 解析参数
+        full_text = " ".join(args)
+        max_concurrent = 3
+        timeout_per_query = 30
+        engine = "google"
+
+        # 提取选项
+        if "--max" in full_text:
+            try:
+                parts = full_text.split("--max")
+                full_text = parts[0]
+                max_val = parts[1].strip().split()[0]
+                max_concurrent = int(max_val)
+            except (IndexError, ValueError):
+                pass
+
+        if "--timeout" in full_text:
+            try:
+                parts = full_text.split("--timeout")
+                full_text = parts[0]
+                timeout_val = parts[1].strip().split()[0]
+                timeout_per_query = int(timeout_val)
+            except (IndexError, ValueError):
+                pass
+
+        if "--engine" in full_text:
+            try:
+                parts = full_text.split("--engine")
+                full_text = parts[0]
+                engine = parts[1].strip().split()[0]
+            except (IndexError, ValueError):
+                pass
+
+        # 解析查询列表 (使用 | 分隔)
+        queries_raw = [q.strip() for q in full_text.split("|") if q.strip()]
+
+        if not queries_raw:
+            await update.message.reply_text("请提供至少一个搜索关键词")
+            return
+
+        # 构建查询列表
+        queries = []
+        for i, query in enumerate(queries_raw):
+            queries.append({
+                "id": f"q{i+1}",
+                "query": query,
+                "engine": engine,
+            })
+
+        task_id = f"parallel_{int(datetime.now().timestamp())}"
+
+        success = await self._send_to_browser_ai("parallel_search", {
+            "task_id": task_id,
+            "queries": queries,
+            "max_concurrent": max_concurrent,
+            "timeout_per_query": timeout_per_query,
+        })
+
+        if success:
+            queries_preview = "\n".join(f"  {i+1}. {q['query']}" for i, q in enumerate(queries[:5]))
+            if len(queries) > 5:
+                queries_preview += f"\n  ... 还有 {len(queries) - 5} 个"
+
+            await update.message.reply_text(
+                f"🔍 <b>并行搜索已启动</b>\n"
+                f"━━━━━━━━━━━━━━━━━━\n"
+                f"查询数: {len(queries)}\n"
+                f"最大并发: {max_concurrent}\n"
+                f"超时: {timeout_per_query}秒\n"
+                f"搜索引擎: {engine}\n\n"
+                f"📋 查询列表:\n{queries_preview}\n\n"
+                f"任务ID: <code>{task_id}</code>",
+                parse_mode="HTML",
+            )
+            self.pending_tasks[task_id] = {
+                "type": "parallel_search",
+                "chat_id": update.effective_chat.id,
+                "queries": queries,
+                "created_at": datetime.now().isoformat(),
+            }
+        else:
+            await update.message.reply_text("❌ 发送失败，Browser-AI 未连接")
+
     async def handle_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """处理回调按钮。"""
         query = update.callback_query
@@ -577,6 +679,16 @@ class BrowserAIServer:
 
                     elif msg_type == "browser_task_progress":
                         await self._handle_browser_task_progress(msg_data)
+
+                    # 并行搜索结果
+                    elif msg_type == "parallel_search_progress":
+                        await self._handle_parallel_search_progress(msg_data)
+
+                    elif msg_type == "parallel_search_complete":
+                        await self._handle_parallel_search_complete(msg_data)
+
+                    elif msg_type == "parallel_search_error":
+                        await self._handle_parallel_search_error(msg_data)
 
                 except json.JSONDecodeError:
                     logger.warning(f"无效JSON: {message[:100]}")
@@ -1000,6 +1112,108 @@ class BrowserAIServer:
 
         # 进度更新可以选择性发送或只记录日志
         logger.info(f"任务 {task_id} 进度: {progress}% - {message_text}")
+
+    # ══════════════════════════════════════════════════════════
+    # 并行搜索结果处理
+    # ══════════════════════════════════════════════════════════
+
+    async def _handle_parallel_search_progress(self, data: dict):
+        """处理并行搜索进度更新。"""
+        task_id = data.get("task_id", "")
+        status = data.get("status", "")
+        total = data.get("total", 0)
+        completed = data.get("completed", 0)
+        current_query = data.get("current_query", "")
+        message_text = data.get("message", "")
+
+        logger.info(f"并行搜索 {task_id}: {completed}/{total} - {message_text}")
+
+        # 只在开始和每5个完成时发送通知，避免刷屏
+        if status == "started" and self.application:
+            for chat_id in TELEGRAM_ADMIN_IDS:
+                try:
+                    await self.application.bot.send_message(
+                        chat_id=chat_id,
+                        text=f"🚀 <b>并行搜索开始</b>\n任务: {task_id}\n总数: {total}",
+                        parse_mode="HTML",
+                    )
+                except Exception as e:
+                    logger.error(f"发送进度通知失败: {e}")
+
+    async def _handle_parallel_search_complete(self, data: dict):
+        """处理并行搜索完成。"""
+        task_id = data.get("task_id", "")
+        total = data.get("total", 0)
+        success_count = data.get("success_count", 0)
+        error_count = data.get("error_count", 0)
+        results = data.get("results", [])
+
+        if not self.application:
+            return
+
+        # 构建结果消息
+        message = (
+            f"✅ <b>并行搜索完成</b>\n"
+            f"━━━━━━━━━━━━━━━━━━\n"
+            f"任务: {task_id}\n"
+            f"总数: {total}\n"
+            f"成功: {success_count} ✅\n"
+            f"失败: {error_count} ❌\n"
+        )
+
+        # 显示前5个结果摘要
+        if results:
+            message += "\n📋 结果摘要:\n"
+            for i, r in enumerate(results[:5], 1):
+                query = r.get("query", "")[:30]
+                status = "✅" if r.get("status") == "success" else "❌"
+                message += f"{i}. {status} {query}\n"
+
+            if len(results) > 5:
+                message += f"... 还有 {len(results) - 5} 个结果\n"
+
+        for chat_id in TELEGRAM_ADMIN_IDS:
+            try:
+                await self.application.bot.send_message(
+                    chat_id=chat_id,
+                    text=message,
+                    parse_mode="HTML",
+                )
+            except Exception as e:
+                logger.error(f"发送并行搜索结果失败: {e}")
+
+        # 清理待处理任务
+        if task_id in self.pending_tasks:
+            del self.pending_tasks[task_id]
+
+    async def _handle_parallel_search_error(self, data: dict):
+        """处理并行搜索错误。"""
+        task_id = data.get("task_id", "")
+        error = data.get("error", "未知错误")
+
+        if not self.application:
+            return
+
+        message = (
+            f"❌ <b>并行搜索失败</b>\n"
+            f"━━━━━━━━━━━━━━━━━━\n"
+            f"任务: {task_id}\n"
+            f"错误: {error}"
+        )
+
+        for chat_id in TELEGRAM_ADMIN_IDS:
+            try:
+                await self.application.bot.send_message(
+                    chat_id=chat_id,
+                    text=message,
+                    parse_mode="HTML",
+                )
+            except Exception as e:
+                logger.error(f"发送并行搜索错误失败: {e}")
+
+        # 清理待处理任务
+        if task_id in self.pending_tasks:
+            del self.pending_tasks[task_id]
 
 
 async def main():
